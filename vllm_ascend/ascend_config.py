@@ -170,6 +170,12 @@ class AscendConfig:
             "VLLM_ASCEND_ENABLE_MATMUL_ALLREDUCE",
             ascend_envs.VLLM_ASCEND_ENABLE_MATMUL_ALLREDUCE,
         )
+        self.enable_shmem_matmul_allreduce = self._get_config_value(
+            additional_config,
+            "enable_shmem_matmul_allreduce",
+            "VLLM_ASCEND_ENABLE_SHMEM_MATMUL_ALLREDUCE",
+            ascend_envs.VLLM_ASCEND_ENABLE_SHMEM_MATMUL_ALLREDUCE,
+        )
         self.enable_fused_mc2 = self._get_config_value(
             additional_config,
             "enable_fused_mc2",

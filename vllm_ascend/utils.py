@@ -896,6 +896,10 @@ def matmul_allreduce_enable() -> bool:
     return get_ascend_config().enable_matmul_allreduce
 
 
+def shmem_matmul_allreduce_enable() -> bool:
+    return get_ascend_config().enable_shmem_matmul_allreduce
+
+
 def enable_sp_by_pass():
     return get_ascend_config().enable_sp_by_pass
 

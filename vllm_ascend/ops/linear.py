@@ -41,12 +41,14 @@ from vllm.model_executor.utils import set_weight_attrs
 from vllm.utils.torch_utils import direct_register_custom_op
 
 from vllm_ascend.ops.linear_op import get_parallel_op, get_replicated_op
+from vllm_ascend.ops.shmem_runtime import finalize_shmem_matmul_allreduce
 from vllm_ascend.utils import (
     AscendDeviceType,
     enable_sp,
     get_ascend_device_type,
     is_310p,
     maybe_trans_nz,
+    shmem_matmul_allreduce_enable,
 )
 
 
@@ -96,6 +98,7 @@ class AscendUnquantizedLinearMethod(UnquantizedLinearMethod):
             # shared_expert_gate in ND format, leaving non-310P policy intact.
             if not keep_nd_weight:
                 layer.weight.data = maybe_trans_nz(layer.weight.data)
+        finalize_shmem_matmul_allreduce(layer)
 
     def apply(
         self,
@@ -295,7 +298,7 @@ class AscendRowParallelLinear(RowParallelLinear):
         disable_tp: bool = False,
     ):
         # TODO(kunpengW-code): Specifying the prefix in linear layers of some models in the vLLM.
-        if enable_sp():
+        if enable_sp() or shmem_matmul_allreduce_enable():
             compilation_config = get_current_vllm_config().compilation_config
             unique_prefix = prefix
             if prefix in compilation_config.static_forward_context:

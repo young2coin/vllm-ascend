@@ -69,6 +69,7 @@ from vllm_ascend.distributed.parallel_state import (
     get_otp_group,
 )
 from vllm_ascend.ops.flashcomm2_oshard_manager import flashcomm2_oshard_manager
+from vllm_ascend.ops.shmem_runtime import prepare_shmem_matmul_allreduce
 from vllm_ascend.utils import (
     enable_dsa_cp,
     enable_dsa_cp_with_layer_shard,
@@ -80,6 +81,7 @@ from vllm_ascend.utils import (
     matmul_allreduce_enable,
     mlp_tp_enable,
     oproj_tp_enable,
+    shmem_matmul_allreduce_enable,
     shared_expert_dp_enabled,
 )
 
@@ -454,6 +456,50 @@ class MatmulAllreduceRowParallelOp(CustomRowParallelOp):
         return cls._HCOMM_INFO
 
 
+class ShmemMatmulAllreduceRowParallelOp(CustomRowParallelOp):
+    """Row-parallel linear using Ascend-overlap SHMEM matmul-allreduce."""
+
+    def __init__(self, layer):
+        super().__init__(layer)
+        self.unique_prefix = None
+        self._can_try_shmem_matmul_allreduce = False
+
+    def apply_impl(self, input_: torch.Tensor) -> torch.Tensor | tuple[torch.Tensor, Parameter | None]:
+        input_parallel = self.get_input_parallel(input_)
+        bias_ = None if (self.tp_rank > 0 or self.skip_bias_add) else self.bias
+
+        if self._can_try_shmem_matmul_allreduce:
+            output = torch.ops.vllm.shmem_matmul_allreduce(input_parallel, self.unique_prefix)
+        else:
+            assert self.quant_method is not None
+            output_parallel = self.quant_method.apply(self.layer, input_parallel, bias=bias_)
+            if self.reduce_results and self.tp_size > 1:
+                output = tensor_model_parallel_all_reduce(output_parallel)
+            else:
+                output = output_parallel
+
+        output_bias = self.bias if self.skip_bias_add else None
+        return output, output_bias
+
+    def update_attrs(self):
+        super().update_attrs()
+        self.unique_prefix = self.layer.unique_prefix
+        quant_method_name = type(self.quant_method).__name__
+        self._can_try_shmem_matmul_allreduce = (
+            shmem_matmul_allreduce_enable()
+            and self.reduce_results
+            and self.tp_size > 1
+            and (self.bias is None or self.skip_bias_add)
+            and "UnquantizedLinearMethod" in quant_method_name
+        )
+        self.layer._can_try_shmem_matmul_allreduce = self._can_try_shmem_matmul_allreduce
+        if self._can_try_shmem_matmul_allreduce:
+            prepare_shmem_matmul_allreduce(self.layer)
+            if getattr(self.layer, "_shmem_static_reason", None) is not None:
+                self._can_try_shmem_matmul_allreduce = False
+                self.layer._can_try_shmem_matmul_allreduce = False
+
+
 class SequenceColumnParallelOp(CustomColumnParallelOp):
     def apply_impl(self, input_: torch.Tensor) -> torch.Tensor | tuple[torch.Tensor, Parameter | None]:
         """Linear layer with column parallelism.
@@ -707,6 +753,7 @@ def _get_row_parallel_op(
     | DSV4OProjRowParallelOp
     | Flashcomm2OProjRowParallelOp
     | MatmulAllreduceRowParallelOp
+    | ShmemMatmulAllreduceRowParallelOp
     | SequenceRowParallelOp
     | ShardedCPRowParallelOp
     | None
@@ -719,6 +766,8 @@ def _get_row_parallel_op(
         return MLPRowParallelOp(layer)
     if "o_proj" in prefix and oproj_tp_enable():
         return OProjRowParallelOp(layer)
+    if shmem_matmul_allreduce_enable() and _is_shmem_matmul_allreduce_prefix(prefix):
+        return ShmemMatmulAllreduceRowParallelOp(layer)
     if matmul_allreduce_enable():
         return MatmulAllreduceRowParallelOp(layer)
     if flashcomm2_enable():
@@ -741,6 +790,17 @@ def _get_row_parallel_op(
     return None
 
 
+def _is_shmem_matmul_allreduce_prefix(prefix: str) -> bool:
+    shmem_row_prefixes = (
+        "o_proj",
+        "out_proj",
+        "down_proj",
+        "attention.dense",
+        "wo_b",
+    )
+    return any(row_prefix in prefix for row_prefix in shmem_row_prefixes)
+
+
 def get_parallel_op(disable_tp, prefix, layer, direct):
     if (
         disable_tp
@@ -758,6 +818,7 @@ def get_parallel_op(disable_tp, prefix, layer, direct):
         | Flashcomm2OProjRowParallelOp
         | Flashcomm2OshardQKVParallelOp
         | MatmulAllreduceRowParallelOp
+        | ShmemMatmulAllreduceRowParallelOp
         | SequenceRowParallelOp
         | ShardedCPRowParallelOp
         | ShardedCPColumnParallelOp
