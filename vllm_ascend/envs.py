@@ -69,6 +69,12 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Whether to enable MatmulAllReduce fusion kernel when tensor parallel is enabled.
     # this feature is supported in A2, and eager mode will get better performance.
     "VLLM_ASCEND_ENABLE_MATMUL_ALLREDUCE": lambda: bool(int(os.getenv("VLLM_ASCEND_ENABLE_MATMUL_ALLREDUCE", "0"))),
+    # Whether to use the experimental aclshmem tile-overlap MatmulAllReduce
+    # kernel for eligible BF16 RowParallelLinear layers.
+    "VLLM_ASCEND_ENABLE_SHMEM_MATMUL_ALLREDUCE": lambda: (
+        os.getenv("VLLM_ASCEND_ENABLE_SHMEM_MATMUL_ALLREDUCE", "0").lower()
+        in {"1", "on", "true", "yes"}
+    ),
     # Whether to enable FlashComm optimization when tensor parallel is enabled.
     # This feature will get better performance when concurrency is large.
     # DEPRECATED: use additional_config.enable_flashcomm1 instead.

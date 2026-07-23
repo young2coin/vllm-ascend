@@ -24,7 +24,7 @@ import torch
 import torch.nn as nn
 from torch.nn.parameter import Parameter
 from vllm.config import get_current_vllm_config
-from vllm.distributed import divide
+from vllm.distributed import divide, split_tensor_along_last_dim
 from vllm.model_executor.layers.linear import (  # noqa
     WEIGHT_LOADER_V2_SUPPORTED,
     ColumnParallelLinear,
@@ -41,6 +41,11 @@ from vllm.model_executor.utils import set_weight_attrs
 from vllm.utils.torch_utils import direct_register_custom_op
 
 from vllm_ascend.ops.linear_op import get_parallel_op, get_replicated_op
+from vllm_ascend.ops.shmem_runtime import (
+    finalize_shmem_matmul_allreduce,
+    prepare_shmem_matmul_allreduce,
+    shmem_matmul_allreduce_enabled,
+)
 from vllm_ascend.utils import (
     AscendDeviceType,
     enable_sp,
@@ -96,6 +101,7 @@ class AscendUnquantizedLinearMethod(UnquantizedLinearMethod):
             # shared_expert_gate in ND format, leaving non-310P policy intact.
             if not keep_nd_weight:
                 layer.weight.data = maybe_trans_nz(layer.weight.data)
+        finalize_shmem_matmul_allreduce(layer)
 
     def apply(
         self,
@@ -295,7 +301,11 @@ class AscendRowParallelLinear(RowParallelLinear):
         disable_tp: bool = False,
     ):
         # TODO(kunpengW-code): Specifying the prefix in linear layers of some models in the vLLM.
-        if enable_sp():
+        shmem_enabled = shmem_matmul_allreduce_enabled()
+        shmem_target = shmem_enabled and any(token in prefix for token in ("o_proj", "down_proj"))
+        shmem_target = shmem_target and "shared_expert" not in prefix
+        self.unique_prefix = prefix
+        if enable_sp() or shmem_target:
             compilation_config = get_current_vllm_config().compilation_config
             unique_prefix = prefix
             if prefix in compilation_config.static_forward_context:
@@ -357,6 +367,26 @@ class AscendRowParallelLinear(RowParallelLinear):
         else:
             self.register_parameter("bias", None)
 
+        if shmem_target and self.custom_op is not None:
+            raise RuntimeError(
+                "SHMEM MatmulAllReduce cannot be combined with the selected "
+                f"row-parallel optimization {type(self.custom_op).__name__}: "
+                f"layer={prefix}"
+            )
+
+        self._can_try_shmem_matmul_allreduce = (
+            shmem_target
+            and reduce_results
+            and 1 < self.tp_size <= 8
+            and isinstance(self.quant_method, AscendUnquantizedLinearMethod)
+            and self.weight.dtype == torch.bfloat16
+            and self.bias is None
+            and self.out_dtype in (None, torch.bfloat16)
+            and get_ascend_device_type() == AscendDeviceType.A2
+        )
+        if self._can_try_shmem_matmul_allreduce:
+            prepare_shmem_matmul_allreduce(self)
+
         if self.custom_op is not None:
             self.custom_op.update_attrs()
 
@@ -365,6 +395,18 @@ class AscendRowParallelLinear(RowParallelLinear):
         input_,
         **kwargs,
     ) -> torch.Tensor | tuple[torch.Tensor, Parameter | None]:
+        if self._can_try_shmem_matmul_allreduce:
+            if self.input_is_parallel:
+                input_parallel = input_
+            else:
+                split_input = split_tensor_along_last_dim(input_, self.tp_size)
+                input_parallel = split_input[self.tp_rank].contiguous()
+
+            output = torch.ops.vllm.shmem_matmul_allreduce(input_parallel, self.unique_prefix)
+            if not self.return_bias:
+                return output
+            return output, None
+
         if self.custom_op is not None:
             return self.custom_op.apply(input_)
 
