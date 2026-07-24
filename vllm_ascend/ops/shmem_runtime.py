@@ -212,6 +212,7 @@ class _ShmemRuntime:
         self._operators: dict[int, object] = {}
         self._kernel_entries: dict[tuple[int, str], Any] = {}
         self._output_buffers: dict[tuple[torch.dtype, str], _SymmetricOutputBuffer] = {}
+        self._printed_operator_call = False
         self._rank: Optional[int] = None
         self._world_size: Optional[int] = None
 
@@ -283,15 +284,6 @@ class _ShmemRuntime:
             self._rank = tp_rank
             self._world_size = tp_size
             self._initialized = True
-            logger.info(
-                "Initialized shmem runtime for matmul-allreduce: "
-                "rank=%s world_size=%s ip_port=%s module=%s build=%s",
-                attr.my_rank,
-                attr.n_ranks,
-                ip_port,
-                getattr(shmem_operators, "__file__", "<unknown>"),
-                getattr(shmem_operators, "__build_info__", "<unknown>"),
-            )
             return None
 
     def get_kernel_entry(self, block_dims: int, kernel_name: str):
@@ -307,6 +299,31 @@ class _ShmemRuntime:
                 kernel_entry = getattr(operator, kernel_name, None)
                 self._kernel_entries[key] = kernel_entry
             return kernel_entry
+
+    def log_operator_call_once(
+        self,
+        layer_name: str,
+        m: int,
+        n: int,
+        k: int,
+        dtype: torch.dtype,
+    ) -> None:
+        with self._lock:
+            if self._printed_operator_call or self._rank != 0:
+                return
+            self._printed_operator_call = True
+            world_size = self._world_size
+
+        logger.warning(
+            "[shmem-operator] called=1 initialized=1 "
+            "rank=0/%s layer=%s shape=(%s,%s,%s) dtype=%s",
+            world_size,
+            layer_name,
+            m,
+            n,
+            k,
+            dtype,
+        )
 
     def get_symmetric_output(
         self,
@@ -366,13 +383,6 @@ class _ShmemRuntime:
                     requested_bytes,
                 )
                 self._output_buffers[key] = buffer
-                logger.info(
-                    "Allocated shmem output buffer: dtype=%s device=%s "
-                    "buffer_bytes=%s",
-                    dtype,
-                    normalized_device,
-                    buffer.buffer_bytes,
-                )
             return buffer.make_tensor(shape, requested_bytes)
 
     def destroy(self) -> None:
@@ -499,5 +509,12 @@ def maybe_shmem_matmul_allreduce(
         weight_t.shape[1],
         input_2d.shape[1],
         stream_handle,
+    )
+    _RUNTIME.log_operator_call_once(
+        str(layer.prefix),
+        int(input_2d.shape[0]),
+        int(weight_t.shape[1]),
+        int(input_2d.shape[1]),
+        input_2d.dtype,
     )
     return output_2d.reshape(*input_parallel.shape[:-1], weight_t.shape[1])

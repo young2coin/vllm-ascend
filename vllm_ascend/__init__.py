@@ -18,6 +18,26 @@
 _GLOBAL_PATCH_APPLIED = False
 
 
+def _register_shmem_env_variables() -> None:
+    """Expose Ascend SHMEM variables to vLLM's validation/cache registry."""
+    import vllm.envs as vllm_envs
+
+    from vllm_ascend.envs import env_variables as ascend_env_variables
+
+    registry = getattr(vllm_envs, "environment_variables", None)
+    if registry is None:
+        registry = getattr(vllm_envs, "env_variables", None)
+    if registry is None:
+        return
+
+    for name, getter in ascend_env_variables.items():
+        if (
+            name == "VLLM_ASCEND_ENABLE_SHMEM_MATMUL_ALLREDUCE"
+            or name.startswith("VLLM_ASCEND_SHMEM_")
+        ):
+            registry.setdefault(name, getter)
+
+
 def _ensure_global_patch():
     """Apply process-wide vLLM patches before engine-core initialization.
 
@@ -38,6 +58,7 @@ def _ensure_global_patch():
 def register():
     """Register the NPU platform."""
 
+    _register_shmem_env_variables()
     return "vllm_ascend.platform.NPUPlatform"
 
 

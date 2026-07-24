@@ -75,6 +75,57 @@ env_variables: dict[str, Callable[[], Any]] = {
         os.getenv("VLLM_ASCEND_ENABLE_SHMEM_MATMUL_ALLREDUCE", "0").lower()
         in {"1", "on", "true", "yes"}
     ),
+    # SHMEM kernel launch/tuning options. These are also registered with
+    # vLLM's environment registry by the Ascend platform plugin so that vLLM
+    # does not report them as unknown and includes them in compile cache keys.
+    "VLLM_ASCEND_SHMEM_AIC_CHUNK_TILES": lambda: os.getenv(
+        "VLLM_ASCEND_SHMEM_AIC_CHUNK_TILES"
+    ),
+    "VLLM_ASCEND_SHMEM_AIV_CHUNK_TILES": lambda: os.getenv(
+        "VLLM_ASCEND_SHMEM_AIV_CHUNK_TILES"
+    ),
+    "VLLM_ASCEND_SHMEM_AIV_ALLGATHER_CHUNK_TILES": lambda: os.getenv(
+        "VLLM_ASCEND_SHMEM_AIV_ALLGATHER_CHUNK_TILES"
+    ),
+    "VLLM_ASCEND_SHMEM_AIV_ACTIVE_CORES": lambda: os.getenv(
+        "VLLM_ASCEND_SHMEM_AIV_ACTIVE_CORES"
+    ),
+    "VLLM_ASCEND_SHMEM_AGMM_COMM_INTERVAL": lambda: os.getenv(
+        "VLLM_ASCEND_SHMEM_AGMM_COMM_INTERVAL"
+    ),
+    "VLLM_ASCEND_SHMEM_MATMUL_AR_REDUCE_METHOD": lambda: os.getenv(
+        "VLLM_ASCEND_SHMEM_MATMUL_AR_REDUCE_METHOD"
+    ),
+    "VLLM_ASCEND_SHMEM_MMRS_REDUCE_ORDER": lambda: os.getenv(
+        "VLLM_ASCEND_SHMEM_MMRS_REDUCE_ORDER"
+    ),
+    "VLLM_ASCEND_SHMEM_OWNER_BASE": lambda: os.getenv(
+        "VLLM_ASCEND_SHMEM_OWNER_BASE"
+    ),
+    "VLLM_ASCEND_SHMEM_BLOCK_DIMS": lambda: os.getenv(
+        "VLLM_ASCEND_SHMEM_BLOCK_DIMS"
+    ),
+    "VLLM_ASCEND_SHMEM_IP_PORT": lambda: os.getenv(
+        "VLLM_ASCEND_SHMEM_IP_PORT"
+    ),
+    "VLLM_ASCEND_SHMEM_LOCAL_MEM_SIZE": lambda: os.getenv(
+        "VLLM_ASCEND_SHMEM_LOCAL_MEM_SIZE"
+    ),
+    "VLLM_ASCEND_SHMEM_OUTPUT_BUFFER_BYTES": lambda: os.getenv(
+        "VLLM_ASCEND_SHMEM_OUTPUT_BUFFER_BYTES"
+    ),
+    "VLLM_ASCEND_SHMEM_OUTPUT_MAX_TOKENS": lambda: os.getenv(
+        "VLLM_ASCEND_SHMEM_OUTPUT_MAX_TOKENS"
+    ),
+    "VLLM_ASCEND_SHMEM_DEBUG_TIMESTAMPS": lambda: os.getenv(
+        "VLLM_ASCEND_SHMEM_DEBUG_TIMESTAMPS"
+    ),
+    "VLLM_ASCEND_SHMEM_DEBUG_TIMESTAMPS_HOST_COLLECT": lambda: os.getenv(
+        "VLLM_ASCEND_SHMEM_DEBUG_TIMESTAMPS_HOST_COLLECT"
+    ),
+    "VLLM_ASCEND_SHMEM_DEBUG_TIMESTAMPS_LIMIT": lambda: os.getenv(
+        "VLLM_ASCEND_SHMEM_DEBUG_TIMESTAMPS_LIMIT"
+    ),
     # Whether to enable FlashComm optimization when tensor parallel is enabled.
     # This feature will get better performance when concurrency is large.
     # DEPRECATED: use additional_config.enable_flashcomm1 instead.
