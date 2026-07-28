@@ -75,6 +75,12 @@ env_variables: dict[str, Callable[[], Any]] = {
         os.getenv("VLLM_ASCEND_ENABLE_SHMEM_MATMUL_ALLREDUCE", "0").lower()
         in {"1", "on", "true", "yes"}
     ),
+    # Whether to use the experimental aclshmem MatmulReduceScatter kernel
+    # for eligible BF16 SequenceRowParallel layers.
+    "VLLM_ASCEND_ENABLE_SHMEM_MATMUL_REDUCE_SCATTER": lambda: (
+        os.getenv("VLLM_ASCEND_ENABLE_SHMEM_MATMUL_REDUCE_SCATTER", "0").lower()
+        in {"1", "on", "true", "yes"}
+    ),
     # SHMEM kernel launch/tuning options. These are also registered with
     # vLLM's environment registry by the Ascend platform plugin so that vLLM
     # does not report them as unknown and includes them in compile cache keys.

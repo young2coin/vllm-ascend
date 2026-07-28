@@ -69,6 +69,7 @@ from vllm_ascend.distributed.parallel_state import (
     get_otp_group,
 )
 from vllm_ascend.ops.flashcomm2_oshard_manager import flashcomm2_oshard_manager
+from vllm_ascend.ops.shmem_runtime import shmem_matmul_reduce_scatter_enabled
 from vllm_ascend.utils import (
     enable_dsa_cp,
     enable_dsa_cp_with_layer_shard,
@@ -566,16 +567,38 @@ class SequenceRowParallelOp(CustomRowParallelOp):
 
         # For unquant
         if mmrs_fusion and isinstance(self.layer.quant_method, UnquantizedLinearMethod):
-            output = torch_npu.npu_mm_reduce_scatter_base(
-                x,
-                self.layer.weight.t(),
-                hcom_name,
-                world_size,
-                reduce_op="sum",
-                bias=None,
-                comm_turn=0,
-                comm_mode=comm_mode,
+            use_shmem_mmrs = (
+                shmem_matmul_reduce_scatter_enabled()
+                and x.dtype == torch.bfloat16
+                and bias_ is None
+                and 1 < world_size <= 8
             )
+            if use_shmem_mmrs:
+                try:
+                    output = torch.ops.vllm.shmem_matmul_reduce_scatter(x, self.unique_prefix)
+                except RuntimeError as exc:
+                    logger.debug("shmem mmrs fallback layer=%s reason=%s", self.layer.prefix, exc)
+                    output = torch_npu.npu_mm_reduce_scatter_base(
+                        x,
+                        self.layer.weight.t(),
+                        hcom_name,
+                        world_size,
+                        reduce_op="sum",
+                        bias=None,
+                        comm_turn=0,
+                        comm_mode=comm_mode,
+                    )
+            else:
+                output = torch_npu.npu_mm_reduce_scatter_base(
+                    x,
+                    self.layer.weight.t(),
+                    hcom_name,
+                    world_size,
+                    reduce_op="sum",
+                    bias=None,
+                    comm_turn=0,
+                    comm_mode=comm_mode,
+                )
             if bias_ is not None:
                 output.add_(bias_)
         # For w8a8 quant

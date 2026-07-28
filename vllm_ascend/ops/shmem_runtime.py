@@ -21,8 +21,11 @@ _DEFAULT_IP_PORT = "tcp://127.0.0.1:8667"
 _OUTPUT_BUFFER_ALIGNMENT = 512
 _MAX_SUPPORTED_RANKS = 8
 _CACHED_BLOCK_DIMS: Optional[int] = None
-_KERNEL_NAME_BY_DTYPE = {
+_ALLREDUCE_KERNEL_NAME_BY_DTYPE = {
     torch.bfloat16: "shmem_matmul_allreduce_overlap_bf16",
+}
+_REDUCE_SCATTER_KERNEL_NAME_BY_DTYPE = {
+    torch.bfloat16: "shmem_matmul_reduce_scatter_bf16",
 }
 
 
@@ -35,6 +38,10 @@ def shmem_matmul_allreduce_enabled() -> bool:
             "together"
         )
     return enabled
+
+
+def shmem_matmul_reduce_scatter_enabled() -> bool:
+    return bool(envs_ascend.VLLM_ASCEND_ENABLE_SHMEM_MATMUL_REDUCE_SCATTER)
 
 
 def _strip_tcp_prefix(ip_port: str) -> str:
@@ -121,7 +128,7 @@ def _build_weight_for_shmem(layer: torch.nn.Module) -> torch.Tensor:
 def prepare_shmem_matmul_allreduce(layer: torch.nn.Module) -> None:
     weight = getattr(layer, "weight", None)
     reason = None
-    kernel_name = _KERNEL_NAME_BY_DTYPE.get(getattr(weight, "dtype", None))
+    kernel_name = _ALLREDUCE_KERNEL_NAME_BY_DTYPE.get(getattr(weight, "dtype", None))
 
     if weight is None:
         reason = "missing_weight"
@@ -137,6 +144,27 @@ def prepare_shmem_matmul_allreduce(layer: torch.nn.Module) -> None:
     setattr(layer, "_shmem_block_dims", _get_block_dims())
     setattr(layer, "_shmem_kernel_entry", None)
     setattr(layer, "_shmem_matmul_allreduce_weight_t", None)
+
+
+def prepare_shmem_matmul_reduce_scatter(layer: torch.nn.Module) -> None:
+    weight = getattr(layer, "weight", None)
+    reason = None
+    kernel_name = _REDUCE_SCATTER_KERNEL_NAME_BY_DTYPE.get(getattr(weight, "dtype", None))
+
+    if weight is None:
+        reason = "missing_weight"
+    elif get_ascend_config().weight_nz_mode == 2:
+        reason = "unsupported_nz_layout"
+    elif weight.ndim != 2:
+        reason = "weight_rank_ne_2"
+    elif kernel_name is None:
+        reason = f"unsupported_weight_dtype:{getattr(weight, 'dtype', None)}"
+
+    setattr(layer, "_shmem_mmrs_static_reason", reason)
+    setattr(layer, "_shmem_mmrs_kernel_name", kernel_name)
+    setattr(layer, "_shmem_mmrs_block_dims", _get_block_dims())
+    setattr(layer, "_shmem_mmrs_kernel_entry", None)
+    setattr(layer, "_shmem_matmul_reduce_scatter_weight_t", None)
 
 
 class _SymmetricOutputBuffer:
@@ -449,6 +477,38 @@ def finalize_shmem_matmul_allreduce(layer: torch.nn.Module) -> None:
     )
 
 
+def finalize_shmem_matmul_reduce_scatter(layer: torch.nn.Module) -> None:
+    static_reason = getattr(layer, "_shmem_mmrs_static_reason", None)
+    if static_reason is None and not hasattr(layer, "_shmem_mmrs_kernel_name"):
+        prepare_shmem_matmul_reduce_scatter(layer)
+        static_reason = getattr(layer, "_shmem_mmrs_static_reason", None)
+
+    if static_reason is not None:
+        raise RuntimeError(
+            f"shmem matmul-reduce-scatter cannot initialize {layer.prefix}: "
+            f"{static_reason}"
+        )
+
+    weight_t = _build_weight_for_shmem(layer)
+    setattr(layer, "_shmem_matmul_reduce_scatter_weight_t", weight_t)
+    if getattr(layer, "_shmem_mmrs_kernel_entry", None) is not None:
+        return
+    init_reason = _RUNTIME.ensure_initialized(layer.tp_rank, layer.tp_size)
+    if init_reason is not None:
+        raise RuntimeError(
+            f"shmem matmul-reduce-scatter cannot initialize {layer.prefix}: "
+            f"{init_reason}"
+        )
+    layer._shmem_mmrs_kernel_entry = _RUNTIME.get_kernel_entry(
+        layer._shmem_mmrs_block_dims, layer._shmem_mmrs_kernel_name
+    )
+    if layer._shmem_mmrs_kernel_entry is None:
+        raise RuntimeError(
+            "shmem_operators does not expose required kernel: "
+            f"{layer._shmem_mmrs_kernel_name}"
+        )
+
+
 def maybe_shmem_matmul_allreduce(
     layer: torch.nn.Module,
     input_parallel: torch.Tensor,
@@ -518,3 +578,92 @@ def maybe_shmem_matmul_allreduce(
         input_2d.dtype,
     )
     return output_2d.reshape(*input_parallel.shape[:-1], weight_t.shape[1])
+
+
+def maybe_shmem_matmul_reduce_scatter(
+    layer: torch.nn.Module,
+    input_parallel: torch.Tensor,
+    bias: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    static_reason = getattr(layer, "_shmem_mmrs_static_reason", None)
+    if static_reason is None and not hasattr(layer, "_shmem_mmrs_kernel_name"):
+        prepare_shmem_matmul_reduce_scatter(layer)
+        static_reason = getattr(layer, "_shmem_mmrs_static_reason", None)
+    if static_reason is not None:
+        raise RuntimeError(f"shmem matmul-reduce-scatter disabled: {static_reason}")
+    if bias is not None:
+        raise RuntimeError(
+            "shmem matmul-reduce-scatter does not support fused bias"
+        )
+
+    if getattr(layer, "_shmem_mmrs_kernel_entry", None) is None:
+        finalize_shmem_matmul_reduce_scatter(layer)
+
+    weight_t = getattr(layer, "_shmem_matmul_reduce_scatter_weight_t", None)
+    if weight_t is None:
+        raise RuntimeError("shmem matmul-reduce-scatter weight is not finalized")
+    if input_parallel.dtype != weight_t.dtype:
+        raise RuntimeError(
+            "shmem matmul-reduce-scatter requires input and weight to use "
+            "the same dtype: "
+            f"input_dtype={input_parallel.dtype} weight_dtype={weight_t.dtype}"
+        )
+    if input_parallel.device != weight_t.device:
+        raise RuntimeError(
+            "shmem matmul-reduce-scatter requires input and weight on the "
+            "same device: "
+            f"input_device={input_parallel.device} "
+            f"weight_device={weight_t.device}"
+        )
+    if input_parallel.shape[-1] != weight_t.shape[0]:
+        raise RuntimeError(
+            "shmem matmul-reduce-scatter input/weight shape mismatch: "
+            f"input_k={input_parallel.shape[-1]} weight_k={weight_t.shape[0]}"
+        )
+
+    kernel_entry = getattr(layer, "_shmem_mmrs_kernel_entry", None)
+    if kernel_entry is None:
+        raise RuntimeError(
+            "shmem matmul-reduce-scatter kernel entry is not initialized"
+        )
+
+    if input_parallel.is_contiguous():
+        input_2d = input_parallel.reshape(-1, input_parallel.shape[-1])
+    else:
+        input_2d = input_parallel.contiguous().reshape(-1, input_parallel.shape[-1])
+
+    if input_2d.shape[0] % layer.tp_size != 0:
+        raise RuntimeError(
+            "shmem matmul-reduce-scatter requires token dimension divisible "
+            f"by tp_size: m={input_2d.shape[0]} tp_size={layer.tp_size}"
+        )
+    output_rows = input_2d.shape[0] // layer.tp_size
+    if output_rows % 128 != 0:
+        raise RuntimeError(
+            "shmem matmul-reduce-scatter requires rows_per_rank divisible "
+            f"by 128: rows_per_rank={output_rows}"
+        )
+
+    output_2d = torch.empty(
+        (output_rows, weight_t.shape[1]),
+        device=input_2d.device,
+        dtype=input_2d.dtype,
+    )
+    stream_handle = _current_stream_handle()
+    kernel_entry(
+        input_2d.data_ptr(),
+        weight_t.data_ptr(),
+        output_2d.data_ptr(),
+        input_2d.shape[0],
+        weight_t.shape[1],
+        input_2d.shape[1],
+        stream_handle,
+    )
+    _RUNTIME.log_operator_call_once(
+        str(layer.prefix),
+        int(input_2d.shape[0]),
+        int(weight_t.shape[1]),
+        int(input_2d.shape[1]),
+        input_2d.dtype,
+    )
+    return output_2d.reshape(*input_parallel.shape[:-2], output_rows, weight_t.shape[1])
