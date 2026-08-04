@@ -43,6 +43,7 @@ from vllm.utils.torch_utils import direct_register_custom_op
 from vllm_ascend.ops.linear_op import get_parallel_op, get_replicated_op
 from vllm_ascend.ops.shmem_runtime import (
     finalize_shmem_matmul_allreduce,
+    log_shmem_path_once,
     prepare_shmem_matmul_allreduce,
     shmem_matmul_allreduce_enabled,
 )
@@ -368,11 +369,13 @@ class AscendRowParallelLinear(RowParallelLinear):
             self.register_parameter("bias", None)
 
         if shmem_target and self.custom_op is not None:
-            raise RuntimeError(
-                "SHMEM MatmulAllReduce cannot be combined with the selected "
-                f"row-parallel optimization {type(self.custom_op).__name__}: "
-                f"layer={prefix}"
+            log_shmem_path_once(
+                f"mmar-skip-custom-op:{prefix}",
+                "op=MMAR layer=%s selected_row_op=%s action=skip_shmem_mmar",
+                prefix,
+                type(self.custom_op).__name__,
             )
+            shmem_target = False
 
         self._can_try_shmem_matmul_allreduce = (
             shmem_target
@@ -386,6 +389,12 @@ class AscendRowParallelLinear(RowParallelLinear):
         )
         if self._can_try_shmem_matmul_allreduce:
             prepare_shmem_matmul_allreduce(self)
+            log_shmem_path_once(
+                f"mmar-ready:{prefix}",
+                "op=MMAR layer=%s selected_row_op=AscendRowParallelLinear "
+                "action=prepare_shmem_mmar",
+                prefix,
+            )
 
         if self.custom_op is not None:
             self.custom_op.update_attrs()
@@ -402,6 +411,11 @@ class AscendRowParallelLinear(RowParallelLinear):
                 split_input = split_tensor_along_last_dim(input_, self.tp_size)
                 input_parallel = split_input[self.tp_rank].contiguous()
 
+            log_shmem_path_once(
+                f"mmar-call:{self.unique_prefix}",
+                "op=MMAR layer=%s action=call_shmem_mmar",
+                self.unique_prefix,
+            )
             output = torch.ops.vllm.shmem_matmul_allreduce(input_parallel, self.unique_prefix)
             if not self.return_bias:
                 return output

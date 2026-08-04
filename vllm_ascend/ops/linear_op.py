@@ -69,7 +69,10 @@ from vllm_ascend.distributed.parallel_state import (
     get_otp_group,
 )
 from vllm_ascend.ops.flashcomm2_oshard_manager import flashcomm2_oshard_manager
-from vllm_ascend.ops.shmem_runtime import shmem_matmul_reduce_scatter_enabled
+from vllm_ascend.ops.shmem_runtime import (
+    log_shmem_path_once,
+    shmem_matmul_reduce_scatter_enabled,
+)
 from vllm_ascend.utils import (
     enable_dsa_cp,
     enable_dsa_cp_with_layer_shard,
@@ -125,6 +128,44 @@ class CustomLinearOp:
         if not self.return_bias:
             return output
         return output, output_bias
+
+
+def _flattened_rows(x: torch.Tensor) -> int:
+    return int(x.numel() // x.shape[-1])
+
+
+def _shmem_mmrs_skip_reason(
+    x: torch.Tensor,
+    world_size: int,
+    bias_: Parameter | None,
+) -> str | None:
+    if not shmem_matmul_reduce_scatter_enabled():
+        return "env_disabled"
+    if x.dtype != torch.bfloat16:
+        return f"unsupported_dtype:{x.dtype}"
+    if bias_ is not None:
+        return "bias_not_supported"
+    if not (1 < world_size <= 8):
+        return f"unsupported_tp_size:{world_size}"
+
+    m = _flattened_rows(x)
+    if m % world_size != 0:
+        return f"m_not_divisible_by_tp:m={m}:tp={world_size}"
+    rows_per_rank = m // world_size
+    if rows_per_rank % 128 != 0:
+        return f"rows_per_rank_not_128_aligned:{rows_per_rank}"
+    return None
+
+
+def _select_row_op(prefix: str, op):
+    if op is not None:
+        log_shmem_path_once(
+            f"row-op:{prefix}",
+            "layer=%s selected_row_op=%s",
+            prefix,
+            type(op).__name__,
+        )
+    return op
 
 
 class CustomColumnParallelOp(CustomLinearOp):
@@ -548,6 +589,11 @@ class SequenceRowParallelOp(CustomRowParallelOp):
         x = input_parallel
 
         if not flash_comm_v1_enabled:
+            log_shmem_path_once(
+                f"mmrs-skip-flashcomm-v1:{self.layer.prefix}",
+                "op=MMRS layer=%s action=skip_shmem_mmrs reason=flash_comm_v1_disabled",
+                self.layer.prefix,
+            )
             output_parallel = self.layer.quant_method.apply(self.layer, x, bias=bias_)
             return tensor_model_parallel_all_reduce(output_parallel)
 
@@ -567,16 +613,26 @@ class SequenceRowParallelOp(CustomRowParallelOp):
 
         # For unquant
         if mmrs_fusion and isinstance(self.layer.quant_method, UnquantizedLinearMethod):
-            use_shmem_mmrs = (
-                shmem_matmul_reduce_scatter_enabled()
-                and x.dtype == torch.bfloat16
-                and bias_ is None
-                and 1 < world_size <= 8
-            )
-            if use_shmem_mmrs:
+            shmem_skip_reason = _shmem_mmrs_skip_reason(x, world_size, bias_)
+            if shmem_skip_reason is None:
                 try:
+                    log_shmem_path_once(
+                        f"mmrs-call:{self.layer.prefix}",
+                        "op=MMRS layer=%s action=call_shmem_mmrs m=%s n=%s k=%s",
+                        self.layer.prefix,
+                        _flattened_rows(x),
+                        self.layer.weight.shape[0],
+                        self.layer.weight.shape[1],
+                    )
                     output = torch.ops.vllm.shmem_matmul_reduce_scatter(x, self.unique_prefix)
                 except RuntimeError as exc:
+                    log_shmem_path_once(
+                        f"mmrs-runtime-fallback:{self.layer.prefix}:{exc}",
+                        "op=MMRS layer=%s action=fallback_native_mmrs "
+                        "reason=runtime_error:%s",
+                        self.layer.prefix,
+                        exc,
+                    )
                     logger.debug("shmem mmrs fallback layer=%s reason=%s", self.layer.prefix, exc)
                     output = torch_npu.npu_mm_reduce_scatter_base(
                         x,
@@ -589,6 +645,12 @@ class SequenceRowParallelOp(CustomRowParallelOp):
                         comm_mode=comm_mode,
                     )
             else:
+                log_shmem_path_once(
+                    f"mmrs-predicate-fallback:{self.layer.prefix}:{shmem_skip_reason}",
+                    "op=MMRS layer=%s action=fallback_native_mmrs reason=%s",
+                    self.layer.prefix,
+                    shmem_skip_reason,
+                )
                 output = torch_npu.npu_mm_reduce_scatter_base(
                     x,
                     self.layer.weight.t(),
@@ -735,18 +797,18 @@ def _get_row_parallel_op(
     | None
 ):
     if "wo_b" in prefix and oproj_tp_enable():
-        return DSV4OProjRowParallelOp(layer)
+        return _select_row_op(prefix, DSV4OProjRowParallelOp(layer))
     if enable_dsa_cp_with_layer_shard() and "o_proj" in prefix:
-        return ShardedCPRowParallelOp(layer)
+        return _select_row_op(prefix, ShardedCPRowParallelOp(layer))
     if "down_proj" in prefix and mlp_tp_enable() and not is_moe_layer(prefix):
-        return MLPRowParallelOp(layer)
+        return _select_row_op(prefix, MLPRowParallelOp(layer))
     if "o_proj" in prefix and oproj_tp_enable():
-        return OProjRowParallelOp(layer)
+        return _select_row_op(prefix, OProjRowParallelOp(layer))
     if matmul_allreduce_enable():
-        return MatmulAllreduceRowParallelOp(layer)
+        return _select_row_op(prefix, MatmulAllreduceRowParallelOp(layer))
     if flashcomm2_enable():
         if "o_proj" in prefix or "out_proj" in prefix:
-            return Flashcomm2OProjRowParallelOp(layer)
+            return _select_row_op(prefix, Flashcomm2OProjRowParallelOp(layer))
     if enable_sp():
         if "shared_expert" in prefix:
             return None
@@ -759,7 +821,7 @@ def _get_row_parallel_op(
         ]
         for a_prefix in sp_row_prefixes:
             if a_prefix in prefix:
-                return SequenceRowParallelOp(layer)
+                return _select_row_op(prefix, SequenceRowParallelOp(layer))
 
     return None
 

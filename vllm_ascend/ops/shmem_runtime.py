@@ -27,6 +27,8 @@ _ALLREDUCE_KERNEL_NAME_BY_DTYPE = {
 _REDUCE_SCATTER_KERNEL_NAME_BY_DTYPE = {
     torch.bfloat16: "shmem_matmul_reduce_scatter_bf16",
 }
+_PATH_LOG_LOCK = threading.Lock()
+_PATH_LOGGED: set[str] = set()
 
 
 def shmem_matmul_allreduce_enabled() -> bool:
@@ -42,6 +44,22 @@ def shmem_matmul_allreduce_enabled() -> bool:
 
 def shmem_matmul_reduce_scatter_enabled() -> bool:
     return bool(envs_ascend.VLLM_ASCEND_ENABLE_SHMEM_MATMUL_REDUCE_SCATTER)
+
+
+def shmem_trace_path_enabled() -> bool:
+    return bool(envs_ascend.VLLM_ASCEND_SHMEM_TRACE_PATH)
+
+
+def log_shmem_path_once(key: str, message: str, *args: object) -> None:
+    if not shmem_trace_path_enabled():
+        return
+    if dist.is_initialized() and dist.get_rank() != 0:
+        return
+    with _PATH_LOG_LOCK:
+        if key in _PATH_LOGGED:
+            return
+        _PATH_LOGGED.add(key)
+    logger.warning("[shmem-path] " + message, *args)
 
 
 def _strip_tcp_prefix(ip_port: str) -> str:

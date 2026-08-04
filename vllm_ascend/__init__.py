@@ -33,6 +33,7 @@ def _register_shmem_env_variables() -> None:
     for name, getter in ascend_env_variables.items():
         if (
             name == "VLLM_ASCEND_ENABLE_SHMEM_MATMUL_ALLREDUCE"
+            or name == "VLLM_ASCEND_ENABLE_SHMEM_MATMUL_REDUCE_SCATTER"
             or name.startswith("VLLM_ASCEND_SHMEM_")
         ):
             registry.setdefault(name, getter)

@@ -132,6 +132,13 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_SHMEM_DEBUG_TIMESTAMPS_LIMIT": lambda: os.getenv(
         "VLLM_ASCEND_SHMEM_DEBUG_TIMESTAMPS_LIMIT"
     ),
+    # Print one-shot routing decisions for SHMEM MMAR/MMRS integration.
+    # This is intentionally separate from timestamp tracing: it answers
+    # whether a layer reached our operators or why it fell back.
+    "VLLM_ASCEND_SHMEM_TRACE_PATH": lambda: (
+        os.getenv("VLLM_ASCEND_SHMEM_TRACE_PATH", "0").lower()
+        in {"1", "on", "true", "yes"}
+    ),
     # Whether to enable FlashComm optimization when tensor parallel is enabled.
     # This feature will get better performance when concurrency is large.
     # DEPRECATED: use additional_config.enable_flashcomm1 instead.
