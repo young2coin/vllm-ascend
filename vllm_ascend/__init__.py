@@ -34,6 +34,7 @@ def _register_shmem_env_variables() -> None:
         if (
             name == "VLLM_ASCEND_ENABLE_SHMEM_MATMUL_ALLREDUCE"
             or name == "VLLM_ASCEND_ENABLE_SHMEM_MATMUL_REDUCE_SCATTER"
+            or name == "VLLM_ASCEND_ENABLE_FLASHCOMM1"
             or name.startswith("VLLM_ASCEND_SHMEM_")
         ):
             registry.setdefault(name, getter)
