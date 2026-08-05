@@ -22,6 +22,11 @@ import os
 from collections.abc import Callable
 from typing import Any
 
+
+def _env_flag(name: str, default: str = "0") -> bool:
+    return os.getenv(name, default).lower() in {"1", "on", "true", "yes"}
+
+
 # The begin-* and end* here are used by the documentation generator
 # to extract the used env vars.
 
@@ -149,7 +154,7 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Whether to enable FlashComm optimization when tensor parallel is enabled.
     # This feature will get better performance when concurrency is large.
     # DEPRECATED: use additional_config.enable_flashcomm1 instead.
-    "VLLM_ASCEND_ENABLE_FLASHCOMM1": lambda: bool(int(os.getenv("VLLM_ASCEND_ENABLE_FLASHCOMM1", "0"))),
+    "VLLM_ASCEND_ENABLE_FLASHCOMM1": lambda: _env_flag("VLLM_ASCEND_ENABLE_FLASHCOMM1"),
     # Whether to enable FLASHCOMM2. Setting it to 0 disables the feature, while setting it to 1 or above enables it.
     # The specific value set will be used as the O-matrix TP group size for flashcomm2.
     # For a detailed introduction to the parameters and the differences and applicable scenarios
