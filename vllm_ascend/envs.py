@@ -139,10 +139,11 @@ env_variables: dict[str, Callable[[], Any]] = {
         os.getenv("VLLM_ASCEND_SHMEM_TRACE_PATH", "0").lower()
         in {"1", "on", "true", "yes"}
     ),
-    # Test-only switch: force eligible row-parallel layers into the SP/MMRS
-    # path so we can measure the custom reduce-scatter operator directly.
-    "VLLM_ASCEND_SHMEM_FORCE_MATMUL_REDUCE_SCATTER": lambda: (
-        os.getenv("VLLM_ASCEND_SHMEM_FORCE_MATMUL_REDUCE_SCATTER", "0").lower()
+    # Prefer the 0.23 SequenceRowParallel/MMRS route for eligible row-parallel
+    # layers when SP and the SHMEM reduce-scatter operator are both enabled.
+    # Runtime token/shape guards still decide whether the custom kernel runs.
+    "VLLM_ASCEND_SHMEM_PREFER_MATMUL_REDUCE_SCATTER": lambda: (
+        os.getenv("VLLM_ASCEND_SHMEM_PREFER_MATMUL_REDUCE_SCATTER", "1").lower()
         in {"1", "on", "true", "yes"}
     ),
     # Whether to enable FlashComm optimization when tensor parallel is enabled.

@@ -71,8 +71,8 @@ from vllm_ascend.distributed.parallel_state import (
 from vllm_ascend.ops.flashcomm2_oshard_manager import flashcomm2_oshard_manager
 from vllm_ascend.ops.shmem_runtime import (
     log_shmem_path_once,
-    shmem_force_matmul_reduce_scatter_enabled,
     shmem_matmul_reduce_scatter_enabled,
+    shmem_prefer_matmul_reduce_scatter_enabled,
 )
 from vllm_ascend.utils import (
     enable_dsa_cp,
@@ -169,7 +169,7 @@ def _select_row_op(prefix: str, op):
     return op
 
 
-def _is_mmrs_row_prefix(prefix: str) -> bool:
+def _is_mmrs_candidate_row_prefix(prefix: str) -> bool:
     return any(
         token in prefix
         for token in (
@@ -179,6 +179,17 @@ def _is_mmrs_row_prefix(prefix: str) -> bool:
             "attention.dense",
             "wo_b",
         )
+    )
+
+
+def _prefer_sequence_mmrs_row_op(prefix: str) -> bool:
+    return (
+        shmem_prefer_matmul_reduce_scatter_enabled()
+        and shmem_matmul_reduce_scatter_enabled()
+        and enable_sp()
+        and _is_mmrs_candidate_row_prefix(prefix)
+        and "shared_expert" not in prefix
+        and not enable_dsa_cp_with_layer_shard()
     )
 
 
@@ -600,16 +611,6 @@ class SequenceRowParallelOp(CustomRowParallelOp):
                 "using defaults: flash_comm_v1=False, mmrs_fusion=False",
             )
 
-        force_mmrs = shmem_force_matmul_reduce_scatter_enabled()
-        if force_mmrs:
-            flash_comm_v1_enabled = True
-            mmrs_fusion = True
-            log_shmem_path_once(
-                f"mmrs-force-context:{self.layer.prefix}",
-                "op=MMRS layer=%s action=force_sequence_mmrs_context",
-                self.layer.prefix,
-            )
-
         x = input_parallel
 
         if not flash_comm_v1_enabled:
@@ -820,16 +821,6 @@ def _get_row_parallel_op(
     | ShardedCPRowParallelOp
     | None
 ):
-    if shmem_force_matmul_reduce_scatter_enabled() and _is_mmrs_row_prefix(prefix):
-        if "shared_expert" in prefix:
-            log_shmem_path_once(
-                f"mmrs-force-skip-shared-expert:{prefix}",
-                "op=MMRS layer=%s action=skip_force_mmrs reason=shared_expert",
-                prefix,
-            )
-            return None
-        return _select_row_op(prefix, SequenceRowParallelOp(layer))
-
     if "wo_b" in prefix and oproj_tp_enable():
         return _select_row_op(prefix, DSV4OProjRowParallelOp(layer))
     if enable_dsa_cp_with_layer_shard() and "o_proj" in prefix:
@@ -838,6 +829,14 @@ def _get_row_parallel_op(
         return _select_row_op(prefix, MLPRowParallelOp(layer))
     if "o_proj" in prefix and oproj_tp_enable():
         return _select_row_op(prefix, OProjRowParallelOp(layer))
+    if _prefer_sequence_mmrs_row_op(prefix):
+        log_shmem_path_once(
+            f"mmrs-prefer-sequence:{prefix}",
+            "op=MMRS layer=%s action=prefer_sequence_row_parallel",
+            prefix,
+        )
+        return _select_row_op(prefix, SequenceRowParallelOp(layer))
+
     if matmul_allreduce_enable():
         return _select_row_op(prefix, MatmulAllreduceRowParallelOp(layer))
     if flashcomm2_enable():
