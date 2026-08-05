@@ -46,6 +46,10 @@ def shmem_matmul_reduce_scatter_enabled() -> bool:
     return bool(envs_ascend.VLLM_ASCEND_ENABLE_SHMEM_MATMUL_REDUCE_SCATTER)
 
 
+def shmem_force_matmul_reduce_scatter_enabled() -> bool:
+    return bool(envs_ascend.VLLM_ASCEND_SHMEM_FORCE_MATMUL_REDUCE_SCATTER)
+
+
 def shmem_trace_path_enabled() -> bool:
     return bool(envs_ascend.VLLM_ASCEND_SHMEM_TRACE_PATH)
 
