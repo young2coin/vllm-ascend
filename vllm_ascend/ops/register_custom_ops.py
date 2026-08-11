@@ -1,6 +1,7 @@
 import torch
 import torch.nn.functional as F
 import torch_npu
+from vllm.config import get_current_vllm_config
 from vllm.distributed import (
     get_dp_group,
     get_ep_group,
@@ -14,8 +15,11 @@ from vllm.forward_context import get_forward_context
 from vllm.utils.torch_utils import direct_register_custom_op
 
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX, MoECommType
+from vllm_ascend.attention.attention_v1 import AscendAttentionState
+from vllm_ascend.attention.utils import notify_kv_cache_written
 from vllm_ascend.ops.rotary_embedding import rope_forward_oot
 from vllm_ascend.ops.shmem_runtime import (
+    log_shmem_path_once,
     maybe_shmem_matmul_allreduce,
     maybe_shmem_matmul_reduce_scatter,
 )
@@ -212,6 +216,107 @@ def _shmem_matmul_reduce_scatter_impl_fake(input_parallel: torch.Tensor, layer_n
     return torch.empty(output_shape, device=input_parallel.device, dtype=input_parallel.dtype)
 
 
+def _resolve_frontend_cache_layer(layer_name: str):
+    forward_context = get_forward_context()
+    no_compile_layers = getattr(forward_context, "no_compile_layers", None)
+    if isinstance(no_compile_layers, dict) and layer_name in no_compile_layers:
+        return no_compile_layers[layer_name]
+    return get_current_vllm_config().compilation_config.static_forward_context.get(layer_name)
+
+
+def _frontend_prefill_kv_cache_impl(
+    key: torch.Tensor,
+    value: torch.Tensor,
+    layer_name: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    forward_context = get_forward_context()
+    per_layer_attn_metadata = getattr(forward_context, "attn_metadata", None)
+    if not isinstance(per_layer_attn_metadata, dict):
+        log_shmem_path_once(
+            f"frontend-kv:{layer_name}:skip:no-per-layer-metadata",
+            "frontend_kv_cache layer=%s action=skip reason=no_per_layer_metadata",
+            layer_name,
+        )
+        return key, value
+
+    attn_metadata = per_layer_attn_metadata.get(layer_name)
+    if attn_metadata is None:
+        log_shmem_path_once(
+            f"frontend-kv:{layer_name}:skip:no-layer-metadata",
+            "frontend_kv_cache layer=%s action=skip reason=no_layer_metadata",
+            layer_name,
+        )
+        return key, value
+
+    if attn_metadata.attn_state in (
+        AscendAttentionState.DecodeOnly,
+        AscendAttentionState.PrefillNoCache,
+    ):
+        log_shmem_path_once(
+            f"frontend-kv:{layer_name}:skip:state:{attn_metadata.attn_state.name}",
+            "frontend_kv_cache layer=%s action=skip reason=state_%s",
+            layer_name,
+            attn_metadata.attn_state.name.lower(),
+        )
+        return key, value
+
+    layer = _resolve_frontend_cache_layer(layer_name)
+    if layer is None:
+        log_shmem_path_once(
+            f"frontend-kv:{layer_name}:skip:no-layer",
+            "frontend_kv_cache layer=%s action=skip reason=layer_not_found",
+            layer_name,
+        )
+        return key, value
+
+    kv_cache = getattr(layer, "kv_cache", None)
+    if not isinstance(kv_cache, (list, tuple)) or len(kv_cache) <= 1:
+        log_shmem_path_once(
+            f"frontend-kv:{layer_name}:skip:no-kv-cache",
+            "frontend_kv_cache layer=%s action=skip reason=kv_cache_unavailable",
+            layer_name,
+        )
+        return key, value
+
+    slot_mapping = getattr(attn_metadata, "slot_mapping", None)
+    if slot_mapping is None:
+        log_shmem_path_once(
+            f"frontend-kv:{layer_name}:skip:no-slot-mapping",
+            "frontend_kv_cache layer=%s action=skip reason=no_slot_mapping",
+            layer_name,
+        )
+        return key, value
+
+    num_actual_tokens = int(getattr(attn_metadata, "num_actual_tokens", key.shape[0]))
+    layer.impl.do_kv_cache_update(
+        layer,
+        key[:num_actual_tokens],
+        value[:num_actual_tokens],
+        kv_cache,
+        slot_mapping[:num_actual_tokens],
+    )
+    attn_metadata.kv_cache_written_by_frontend = True
+    attn_metadata.reshape_cache_event = None
+    notify_kv_cache_written()
+    log_shmem_path_once(
+        f"frontend-kv:{layer_name}:hit",
+        "frontend_kv_cache layer=%s action=hit state=%s tokens=%d graph_capture=%s",
+        layer_name,
+        attn_metadata.attn_state.name.lower(),
+        num_actual_tokens,
+        bool(getattr(forward_context, "capturing", False)),
+    )
+    return key, value
+
+
+def _frontend_prefill_kv_cache_impl_fake(
+    key: torch.Tensor,
+    value: torch.Tensor,
+    layer_name: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return key, value
+
+
 # TODO(Angazenn): The reason why we use a custom op to encapsulate npu_quantize
 # is that aclnnAscendQuantV3(npu_quantize) use div_mode=False, while
 # aclnnAddRmsNormQuantV2(npu_add_rms_norm_quant) use div_moe=True. We have to
@@ -318,6 +423,14 @@ direct_register_custom_op(
     op_name="shmem_matmul_reduce_scatter",
     op_func=_shmem_matmul_reduce_scatter_impl,
     fake_impl=_shmem_matmul_reduce_scatter_impl_fake,
+    mutates_args=[],
+    dispatch_key="PrivateUse1",
+)
+
+direct_register_custom_op(
+    op_name="frontend_prefill_kv_cache",
+    op_func=_frontend_prefill_kv_cache_impl,
+    fake_impl=_frontend_prefill_kv_cache_impl_fake,
     mutates_args=[],
     dispatch_key="PrivateUse1",
 )

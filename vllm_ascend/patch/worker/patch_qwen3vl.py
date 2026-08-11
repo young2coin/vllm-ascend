@@ -53,6 +53,7 @@ def forward_with_split_qkv_rmsnorm_mrope(self, positions: torch.Tensor, hidden_s
             is_interleaved=self.rotary_emb.mrope_interleaved,
             rope_dim=self.rotary_emb.rotary_dim,
         )
+        k, v = torch.ops.vllm.frontend_prefill_kv_cache(k, v, self.attn.layer_name)
     else:
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q_by_head = q.view(*q.shape[:-1], q.shape[-1] // self.head_dim, self.head_dim)
@@ -62,6 +63,7 @@ def forward_with_split_qkv_rmsnorm_mrope(self, positions: torch.Tensor, hidden_s
         k_by_head = self.k_norm(k_by_head)
         k = k_by_head.view(k.shape)
         q, k = self.rotary_emb(positions, q, k)
+        k, v = torch.ops.vllm.frontend_prefill_kv_cache(k, v, self.attn.layer_name)
     attn_output = self.attn(q, k, v)
     output, _ = self.o_proj(attn_output)
     return output

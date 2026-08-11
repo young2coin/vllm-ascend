@@ -217,6 +217,10 @@ class AscendMetadata:
     model_runner_type: str = ""
     # prefill reshape_and_cache event
     reshape_cache_event: torch.npu.Event = None
+    # True when a model-specific fused front-end path has already written the
+    # current prefill KV tensors into cache, so the generic attention backend
+    # must skip its duplicate reshape/cache step.
+    kv_cache_written_by_frontend: bool = False
 
     kvcomp_metadata: KVCompMetaData | None = None
 
@@ -1311,6 +1315,10 @@ class AscendAttentionBackendImpl(AttentionImpl):
         attn_metadata: AscendMetadata,
         output: torch.Tensor,
     ):
+        if attn_metadata.kv_cache_written_by_frontend:
+            attn_metadata.kv_cache_written_by_frontend = False
+            attn_metadata.reshape_cache_event = None
+            return query, key, value, output
         if len(kv_cache) > 1:
             if self.key_cache is None:
                 self.key_cache, self.value_cache = kv_cache[0], kv_cache[1]
