@@ -71,6 +71,7 @@ from vllm_ascend.distributed.parallel_state import (
 from vllm_ascend.ops.flashcomm2_oshard_manager import flashcomm2_oshard_manager
 from vllm_ascend.ops.shmem_runtime import (
     log_shmem_path_once,
+    shmem_force_matmul_reduce_scatter_enabled,
     shmem_matmul_reduce_scatter_enabled,
     shmem_prefer_matmul_reduce_scatter_enabled,
 )
@@ -184,7 +185,7 @@ def _is_mmrs_candidate_row_prefix(prefix: str) -> bool:
 
 def _prefer_sequence_mmrs_row_op(prefix: str) -> bool:
     return (
-        shmem_prefer_matmul_reduce_scatter_enabled()
+        (shmem_force_matmul_reduce_scatter_enabled() or shmem_prefer_matmul_reduce_scatter_enabled())
         and shmem_matmul_reduce_scatter_enabled()
         and enable_sp()
         and _is_mmrs_candidate_row_prefix(prefix)
@@ -612,8 +613,9 @@ class SequenceRowParallelOp(CustomRowParallelOp):
             )
 
         x = input_parallel
+        force_mmrs = shmem_force_matmul_reduce_scatter_enabled()
 
-        if not flash_comm_v1_enabled:
+        if not flash_comm_v1_enabled and not force_mmrs:
             log_shmem_path_once(
                 f"mmrs-skip-flashcomm-v1:{self.layer.prefix}",
                 "op=MMRS layer=%s action=skip_shmem_mmrs reason=flash_comm_v1_disabled",
@@ -621,6 +623,12 @@ class SequenceRowParallelOp(CustomRowParallelOp):
             )
             output_parallel = self.layer.quant_method.apply(self.layer, x, bias=bias_)
             return tensor_model_parallel_all_reduce(output_parallel)
+        if force_mmrs and not flash_comm_v1_enabled:
+            log_shmem_path_once(
+                f"mmrs-force-flashcomm-v1:{self.layer.prefix}",
+                "op=MMRS layer=%s action=force_shmem_mmrs bypass=flash_comm_v1_disabled",
+                self.layer.prefix,
+            )
 
         pad_size = _EXTRA_CTX.pad_size
         dsa_cp_attn_out = enable_dsa_cp() and ("o_proj" in self.layer.prefix or "wo_b" in self.layer.prefix)

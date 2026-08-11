@@ -151,6 +151,12 @@ env_variables: dict[str, Callable[[], Any]] = {
         os.getenv("VLLM_ASCEND_SHMEM_PREFER_MATMUL_REDUCE_SCATTER", "1").lower()
         in {"1", "on", "true", "yes"}
     ),
+    # Force the SHMEM MMRS path even when the normal FlashComm1 token threshold
+    # or MoE-specific gating would keep it disabled.
+    "VLLM_ASCEND_SHMEM_FORCE_MATMUL_REDUCE_SCATTER": lambda: (
+        os.getenv("VLLM_ASCEND_SHMEM_FORCE_MATMUL_REDUCE_SCATTER", "0").lower()
+        in {"1", "on", "true", "yes"}
+    ),
     # Whether to enable FlashComm optimization when tensor parallel is enabled.
     # This feature will get better performance when concurrency is large.
     # DEPRECATED: use additional_config.enable_flashcomm1 instead.

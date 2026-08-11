@@ -988,11 +988,21 @@ class NPUPlatform(Platform):
         # the performance may degrade due to the switching of
         # communication methods.
         mmrs_fusion = True
+        force_mmrs = False
+        try:
+            from vllm_ascend.ops.shmem_runtime import shmem_force_matmul_reduce_scatter_enabled
+
+            force_mmrs = shmem_force_matmul_reduce_scatter_enabled()
+        except Exception:
+            force_mmrs = False
         if is_moe_model(vllm_config):
             flash_comm_v1_enabled = enable_sp(vllm_config) and num_tokens is not None
-            mmrs_fusion = False
+            if not force_mmrs:
+                mmrs_fusion = False
         else:
             flash_comm_v1_enabled = enable_sp(vllm_config) and num_tokens is not None and num_tokens > 1000
+            if force_mmrs:
+                flash_comm_v1_enabled = enable_sp(vllm_config) and num_tokens is not None
 
         # TODO(Levi-JQ): another PR to normalize the enabling logic for sp/fc2
         flashcomm_v2_enabled = flashcomm2_enable() and tp_world_size > 1 and num_tokens is not None

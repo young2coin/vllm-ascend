@@ -112,6 +112,13 @@ def set_ascend_forward_context(
         forward_context.sinks = has_sinks
 
         # TODO: remove it when torch_npu.npu_mm_reduce_scatter_base supports tp_size >= 16.
+        force_mmrs = False
+        try:
+            from vllm_ascend.ops.shmem_runtime import shmem_force_matmul_reduce_scatter_enabled
+
+            force_mmrs = shmem_force_matmul_reduce_scatter_enabled()
+        except Exception:
+            force_mmrs = False
         mmrs_fusion = tp_world_size <= 8
 
         # set for sequence parallelism, 1000 is the batch size concurrency threshold
@@ -125,13 +132,16 @@ def set_ascend_forward_context(
         is_context_moe_model = is_drafter_moe_model(vllm_config) if is_draft_model else is_moe_model(vllm_config)
         if is_context_moe_model:
             flash_comm_v1_enabled = enable_sp(vllm_config) and num_tokens is not None
-            mmrs_fusion = False
+            if not force_mmrs:
+                mmrs_fusion = False
         elif is_draft_model:
             # TODO: for dense drafter, `sp` is redundant and is not compatible with `dp` and `graph`.
             # Disable it to avoid more problems.
             flash_comm_v1_enabled = False
         else:
             flash_comm_v1_enabled = enable_sp(vllm_config) and num_tokens is not None and num_tokens > 1000
+            if force_mmrs:
+                flash_comm_v1_enabled = enable_sp(vllm_config) and num_tokens is not None
         forward_context.mmrs_fusion = mmrs_fusion
         forward_context.num_tokens = num_tokens
         forward_context.flash_comm_v1_enabled = flash_comm_v1_enabled
