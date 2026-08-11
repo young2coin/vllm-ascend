@@ -1146,6 +1146,8 @@ class AscendAttentionBackendImpl(AttentionImpl):
             )
         num_tokens = attn_metadata.actual_seq_lengths_q[-1]
         query = query[:num_tokens]
+        output_view = output[:num_tokens].view(num_tokens, self.num_heads, self.head_size)
+        softmax_lse = torch.empty(self.num_heads, num_tokens, dtype=torch.float32, device=query.device)
         if (
             attn_metadata.attn_state == AscendAttentionState.PrefillNoCache
             and self.attn_type != AttentionType.ENCODER_DECODER
@@ -1181,7 +1183,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
             )
         else:
             if not attn_metadata.causal:
-                attn_output, _ = torch_npu.npu_fused_infer_attention_score(
+                torch_npu.npu_fused_infer_attention_score.out(
                     query=query,
                     key=key,
                     value=value,
@@ -1194,9 +1196,10 @@ class AscendAttentionBackendImpl(AttentionImpl):
                     num_heads=self.num_heads,
                     scale=self.scale,
                     sparse_mode=0,
+                    out=[output_view, softmax_lse],
                 )
             elif self.sliding_window is not None:
-                attn_output, _ = torch_npu.npu_fused_infer_attention_score(
+                torch_npu.npu_fused_infer_attention_score.out(
                     query=query,
                     key=key,
                     value=value,
@@ -1212,6 +1215,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
                     pre_tokens=self.sliding_window,
                     next_tokens=0,
                     sparse_mode=4,
+                    out=[output_view, softmax_lse],
                 )
             else:
                 attn_output, _ = DeviceOperator.npu_fused_infer_attention_score(
@@ -1234,11 +1238,14 @@ class AscendAttentionBackendImpl(AttentionImpl):
                     current_value=passed_value,
                     attn_metadata=attn_metadata,
                     is_prefill_no_cache=attn_metadata.attn_state == AscendAttentionState.PrefillNoCache,
+                    output_tensor=output_view,
+                    softmax_lse_tensor=softmax_lse,
                     sparse_mode=3,
                 )
-
-            attn_output = attn_output.view(num_tokens, self.num_heads, self.head_size)
-        output[:num_tokens] = attn_output[:num_tokens]
+                output_view = attn_output
+            attn_output = output_view
+        if attn_output.data_ptr() != output_view.data_ptr():
+            output[:num_tokens] = attn_output[:num_tokens]
         return output
 
     def _forward_encoder_attention(
