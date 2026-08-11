@@ -1127,11 +1127,13 @@ class AscendAttentionBackendImpl(AttentionImpl):
         if _EXTRA_CTX.capturing:
             if self.sinks is not None:
                 attn_output, num_tokens = self.full_graph_fia_v2(query, key, value, attn_metadata, output)
-                output[:num_tokens] = attn_output[:num_tokens]
+                if attn_output.data_ptr() != output.data_ptr():
+                    output[:num_tokens] = attn_output[:num_tokens]
                 return output
             else:
                 attn_output, num_tokens = self.full_graph_fia(query, key, value, attn_metadata, output)
-                output[:num_tokens] = attn_output[:num_tokens]
+                if attn_output.data_ptr() != output.data_ptr():
+                    output[:num_tokens] = attn_output[:num_tokens]
                 return output
         passed_key = key
         passed_value = value
@@ -1180,6 +1182,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 learnable_sink=self.sinks,
             )
         else:
+            prefill_no_cache = attn_metadata.attn_state == AscendAttentionState.PrefillNoCache
             if not attn_metadata.causal:
                 attn_output, _ = torch_npu.npu_fused_infer_attention_score(
                     query=query,
@@ -1233,12 +1236,16 @@ class AscendAttentionBackendImpl(AttentionImpl):
                     current_key=passed_key,
                     current_value=passed_value,
                     attn_metadata=attn_metadata,
-                    is_prefill_no_cache=attn_metadata.attn_state == AscendAttentionState.PrefillNoCache,
+                    is_prefill_no_cache=prefill_no_cache,
+                    output_tensor=output if prefill_no_cache else None,
                     sparse_mode=3,
                 )
-
-            attn_output = attn_output.view(num_tokens, self.num_heads, self.head_size)
-        output[:num_tokens] = attn_output[:num_tokens]
+            if not prefill_no_cache:
+                attn_output = attn_output.view(num_tokens, self.num_heads, self.head_size)
+            else:
+                return output
+        if attn_output.data_ptr() != output.data_ptr():
+            output[:num_tokens] = attn_output[:num_tokens]
         return output
 
     def _forward_encoder_attention(

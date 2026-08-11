@@ -12,6 +12,27 @@ from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.ops.rotary_embedding import AscendMRotaryEmbedding
 
 
+def _get_split_qkv_rmsnorm_mrope_buffers(
+    layer: torch.nn.Module,
+    qkv: torch.Tensor,
+    q_size: int,
+    kv_size: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    cache_key = (qkv.device, qkv.dtype, qkv.shape[0], q_size, kv_size)
+    cache = getattr(layer, "_split_qkv_rmsnorm_mrope_buffer_cache", None)
+    if cache is None:
+        cache = {}
+        layer._split_qkv_rmsnorm_mrope_buffer_cache = cache
+    if cache_key not in cache:
+        cache[cache_key] = (
+            torch.empty((qkv.shape[0], q_size), dtype=qkv.dtype, device=qkv.device),
+            torch.empty((qkv.shape[0], kv_size), dtype=qkv.dtype, device=qkv.device),
+            torch.empty((qkv.shape[0], kv_size), dtype=qkv.dtype, device=qkv.device),
+            torch.empty((qkv.shape[0], 0), dtype=qkv.dtype, device=qkv.device),
+        )
+    return cache[cache_key]
+
+
 def tensor_parallel_wrap(func):
     def wrap(*args, **kwargs):
         deepstack_input_embeds = func(*args, **kwargs)
@@ -40,6 +61,12 @@ def forward_with_split_qkv_rmsnorm_mrope(self, positions: torch.Tensor, hidden_s
             cos_sin = cos_sin.to(qkv.device)
         if cos_sin.dtype != qkv.dtype:
             cos_sin = cos_sin.to(qkv.dtype)
+        q_output, k_output, v_output, gate_output = _get_split_qkv_rmsnorm_mrope_buffers(
+            self,
+            qkv,
+            self.q_size,
+            self.kv_size,
+        )
         q, k, v, _ = torch.ops.vllm.triton_split_qkv_rmsnorm_mrope(
             qkv=qkv,
             q_weight=self.q_norm.weight,
@@ -52,6 +79,10 @@ def forward_with_split_qkv_rmsnorm_mrope(self, positions: torch.Tensor, hidden_s
             mrope_section=self.rotary_emb.mrope_section,
             is_interleaved=self.rotary_emb.mrope_interleaved,
             rope_dim=self.rotary_emb.rotary_dim,
+            q_output=q_output,
+            k_output=k_output,
+            v_output=v_output,
+            gate_output=gate_output,
         )
     else:
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)

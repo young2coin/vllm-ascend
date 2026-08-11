@@ -294,7 +294,26 @@ def triton_split_qkv_rmsnorm_mrope(
     q_bias: torch.Tensor | None = None,
     k_bias: torch.Tensor | None = None,
     has_gate: bool = False,
+    q_output: torch.Tensor | None = None,
+    k_output: torch.Tensor | None = None,
+    v_output: torch.Tensor | None = None,
+    gate_output: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    def _ensure_output(
+        out: torch.Tensor | None,
+        rows: int,
+        cols: int,
+    ) -> torch.Tensor:
+        if out is None:
+            return torch.empty(rows, cols, device=qkv.device, dtype=qkv.dtype)
+        if out.shape != (rows, cols):
+            raise ValueError(
+                f"split_qkv_rmsnorm_mrope output shape mismatch: expected {(rows, cols)}, got {tuple(out.shape)}"
+            )
+        if out.device != qkv.device or out.dtype != qkv.dtype:
+            raise ValueError("split_qkv_rmsnorm_mrope output device/dtype mismatch")
+        return out
+
     core_num = get_vectorcore_num()
 
     q_size = num_q_heads * head_size
@@ -319,10 +338,10 @@ def triton_split_qkv_rmsnorm_mrope(
 
     num_tokens_each_tail_core = num_tokens // core_num
 
-    q_output = torch.empty(num_tokens, q_size, device=qkv.device, dtype=qkv.dtype)
-    k_output = torch.empty(num_tokens, kv_size, device=qkv.device, dtype=qkv.dtype)
-    v_output = torch.empty(num_tokens, kv_size, device=qkv.device, dtype=qkv.dtype)
-    gate_output = torch.empty(num_tokens, gate_size, device=qkv.device, dtype=qkv.dtype)
+    q_output = _ensure_output(q_output, num_tokens, q_size)
+    k_output = _ensure_output(k_output, num_tokens, kv_size)
+    v_output = _ensure_output(v_output, num_tokens, kv_size)
+    gate_output = _ensure_output(gate_output, num_tokens, gate_size)
 
     total_core = front_core_num + tail_core_num
     block_dim = core_num
@@ -381,39 +400,24 @@ def triton_split_qkv_rmsnorm_mrope_fake(
     q_bias: torch.Tensor | None = None,
     k_bias: torch.Tensor | None = None,
     has_gate: bool = False,
+    q_output: torch.Tensor | None = None,
+    k_output: torch.Tensor | None = None,
+    v_output: torch.Tensor | None = None,
+    gate_output: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     num_tokens = qkv.shape[0]
     q_size = num_q_heads * head_size
     kv_size = num_kv_heads * head_size
     gate_size = q_size if has_gate else 0
 
-    q_output = torch.empty(
-        num_tokens,
-        q_size,
-        device=qkv.device,
-        dtype=qkv.dtype,
-    )
-
-    k_output = torch.empty(
-        num_tokens,
-        kv_size,
-        device=qkv.device,
-        dtype=qkv.dtype,
-    )
-
-    v_output = torch.empty(
-        num_tokens,
-        kv_size,
-        device=qkv.device,
-        dtype=qkv.dtype,
-    )
-
-    gate_output = torch.empty(
-        num_tokens,
-        gate_size,
-        device=qkv.device,
-        dtype=qkv.dtype,
-    )
+    if q_output is None:
+        q_output = torch.empty(num_tokens, q_size, device=qkv.device, dtype=qkv.dtype)
+    if k_output is None:
+        k_output = torch.empty(num_tokens, kv_size, device=qkv.device, dtype=qkv.dtype)
+    if v_output is None:
+        v_output = torch.empty(num_tokens, kv_size, device=qkv.device, dtype=qkv.dtype)
+    if gate_output is None:
+        gate_output = torch.empty(num_tokens, gate_size, device=qkv.device, dtype=qkv.dtype)
 
     return q_output, k_output, v_output, gate_output
 
@@ -422,6 +426,6 @@ direct_register_custom_op(
     op_name="triton_split_qkv_rmsnorm_mrope",
     op_func=triton_split_qkv_rmsnorm_mrope,
     fake_impl=triton_split_qkv_rmsnorm_mrope_fake,
-    mutates_args=[],
+    mutates_args=["q_output", "k_output", "v_output", "gate_output"],
     dispatch_key="PrivateUse1",
 )

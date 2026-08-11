@@ -38,6 +38,28 @@ from vllm_ascend.utils import is_310p
 _GDN_PATCH_TARGET = _GDNBaseCls
 
 
+def _get_split_qkv_rmsnorm_mrope_buffers(
+    layer: torch.nn.Module,
+    qkv: torch.Tensor,
+    q_size: int,
+    kv_size: int,
+    gate_size: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    cache_key = (qkv.device, qkv.dtype, qkv.shape[0], q_size, kv_size, gate_size)
+    cache = getattr(layer, "_split_qkv_rmsnorm_mrope_buffer_cache", None)
+    if cache is None:
+        cache = {}
+        layer._split_qkv_rmsnorm_mrope_buffer_cache = cache
+    if cache_key not in cache:
+        cache[cache_key] = (
+            torch.empty((qkv.shape[0], q_size), dtype=qkv.dtype, device=qkv.device),
+            torch.empty((qkv.shape[0], kv_size), dtype=qkv.dtype, device=qkv.device),
+            torch.empty((qkv.shape[0], kv_size), dtype=qkv.dtype, device=qkv.device),
+            torch.empty((qkv.shape[0], gate_size), dtype=qkv.dtype, device=qkv.device),
+        )
+    return cache[cache_key]
+
+
 class AscendQwen3NextAttention(Qwen3NextAttention):
     def forward(self, positions: torch.Tensor, output: torch.Tensor, hidden_states: torch.Tensor):
         qkv, _ = self.qkv_proj(hidden_states)
@@ -47,6 +69,14 @@ class AscendQwen3NextAttention(Qwen3NextAttention):
                 cos_sin = cos_sin.to(qkv.device)
             if cos_sin.dtype != qkv.dtype:
                 cos_sin = cos_sin.to(qkv.dtype)
+            gate_size = self.q_size if self.attn_output_gate else 0
+            q_output, k_output, v_output, gate_output = _get_split_qkv_rmsnorm_mrope_buffers(
+                self,
+                qkv,
+                self.q_size,
+                self.kv_size,
+                gate_size,
+            )
 
             q, k, v, gate = torch.ops.vllm.triton_split_qkv_rmsnorm_mrope(
                 qkv=qkv,
@@ -61,6 +91,10 @@ class AscendQwen3NextAttention(Qwen3NextAttention):
                 is_interleaved=self.rotary_emb.mrope_interleaved,
                 rope_dim=self.rotary_emb.rotary_dim,
                 has_gate=self.attn_output_gate,
+                q_output=q_output,
+                k_output=k_output,
+                v_output=v_output,
+                gate_output=gate_output,
             )
         else:
             if self.attn_output_gate:

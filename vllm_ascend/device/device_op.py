@@ -72,6 +72,8 @@ class BaseDeviceAdaptor:
         head_size: int,
         scale: float,
         is_prefill_no_cache: bool,
+        output_tensor: torch.Tensor | None = None,
+        softmax_lse_tensor: torch.Tensor | None = None,
         **kwargs,
     ):
         # TODO: Remove this fallback when A2/A3 FIA TND supports Gemma4's
@@ -93,10 +95,31 @@ class BaseDeviceAdaptor:
                 is_prefill_no_cache=is_prefill_no_cache,
             )
 
+        key_arg = key if key.is_contiguous() else key.contiguous()
+        value_arg = value if value.is_contiguous() else value.contiguous()
+        if output_tensor is not None:
+            if softmax_lse_tensor is None:
+                softmax_lse_tensor = torch.empty(
+                    (num_heads, query.shape[0]),
+                    dtype=torch.float32,
+                    device=query.device,
+                )
+            torch_npu.npu_fused_infer_attention_score.out(
+                query=query,
+                key=key_arg,
+                value=value_arg,
+                num_key_value_heads=num_key_value_heads,
+                num_heads=num_heads,
+                scale=scale,
+                out=[output_tensor, softmax_lse_tensor],
+                **kwargs,
+            )
+            return output_tensor, softmax_lse_tensor
+
         return torch_npu.npu_fused_infer_attention_score(
             query=query,
-            key=key.contiguous(),
-            value=value.contiguous(),
+            key=key_arg,
+            value=value_arg,
             num_key_value_heads=num_key_value_heads,
             num_heads=num_heads,
             scale=scale,
