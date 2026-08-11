@@ -647,16 +647,29 @@ class SequenceRowParallelOp(CustomRowParallelOp):
         # For unquant
         if mmrs_fusion and isinstance(self.layer.quant_method, UnquantizedLinearMethod):
             shmem_skip_reason = _shmem_mmrs_skip_reason(x, world_size, bias_)
-            if shmem_skip_reason is None:
+            if shmem_skip_reason is None or (
+                force_mmrs and shmem_skip_reason.startswith("rows_per_rank_not_128_aligned")
+            ):
                 try:
-                    log_shmem_path_once(
-                        f"mmrs-call:{self.layer.prefix}",
-                        "op=MMRS layer=%s action=call_shmem_mmrs m=%s n=%s k=%s",
-                        self.layer.prefix,
-                        _flattened_rows(x),
-                        self.layer.weight.shape[0],
-                        self.layer.weight.shape[1],
-                    )
+                    if shmem_skip_reason is None:
+                        log_shmem_path_once(
+                            f"mmrs-call:{self.layer.prefix}",
+                            "op=MMRS layer=%s action=call_shmem_mmrs m=%s n=%s k=%s",
+                            self.layer.prefix,
+                            _flattened_rows(x),
+                            self.layer.weight.shape[0],
+                            self.layer.weight.shape[1],
+                        )
+                    else:
+                        log_shmem_path_once(
+                            f"mmrs-force-align:{self.layer.prefix}:{shmem_skip_reason}",
+                            "op=MMRS layer=%s action=force_shmem_mmrs_pad reason=%s m=%s n=%s k=%s",
+                            self.layer.prefix,
+                            shmem_skip_reason,
+                            _flattened_rows(x),
+                            self.layer.weight.shape[0],
+                            self.layer.weight.shape[1],
+                        )
                     output = torch.ops.vllm.shmem_matmul_reduce_scatter(x, self.unique_prefix)
                 except RuntimeError as exc:
                     log_shmem_path_once(

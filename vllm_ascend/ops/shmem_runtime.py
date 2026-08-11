@@ -663,15 +663,25 @@ def maybe_shmem_matmul_reduce_scatter(
             "shmem matmul-reduce-scatter requires token dimension divisible "
             f"by tp_size: m={input_2d.shape[0]} tp_size={layer.tp_size}"
         )
-    output_rows = input_2d.shape[0] // layer.tp_size
-    if output_rows % 128 != 0:
-        raise RuntimeError(
-            "shmem matmul-reduce-scatter requires rows_per_rank divisible "
-            f"by 128: rows_per_rank={output_rows}"
+
+    original_rows = input_2d.shape[0] // layer.tp_size
+    rows_pad = (-original_rows) % 128
+    padded_rows = original_rows + rows_pad
+    if rows_pad > 0:
+        padded_m = padded_rows * layer.tp_size
+        padded_input_2d = torch.zeros(
+            (padded_m, input_2d.shape[1]),
+            device=input_2d.device,
+            dtype=input_2d.dtype,
         )
+        padded_input_2d[: input_2d.shape[0]].copy_(input_2d)
+        input_2d = padded_input_2d
+        padded_output_rows = padded_rows
+    else:
+        padded_output_rows = original_rows
 
     output_2d = torch.empty(
-        (output_rows, weight_t.shape[1]),
+        (padded_output_rows, weight_t.shape[1]),
         device=input_2d.device,
         dtype=input_2d.dtype,
     )
@@ -692,4 +702,14 @@ def maybe_shmem_matmul_reduce_scatter(
         int(input_2d.shape[1]),
         input_2d.dtype,
     )
-    return output_2d.reshape(*input_parallel.shape[:-2], output_rows, weight_t.shape[1])
+    if rows_pad > 0:
+        logger.warning(
+            "[shmem-path] op=MMRS layer=%s action=pad_rows_for_128 "
+            "rows_per_rank=%s padded_rows_per_rank=%s",
+            layer.prefix,
+            original_rows,
+            padded_rows,
+        )
+    return output_2d[:original_rows].reshape(
+        *input_parallel.shape[:-2], original_rows, weight_t.shape[1]
+    )
