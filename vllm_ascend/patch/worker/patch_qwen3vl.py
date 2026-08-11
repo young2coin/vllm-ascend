@@ -1,6 +1,5 @@
 import torch
 from vllm.distributed import get_tensor_model_parallel_rank, get_tensor_model_parallel_world_size
-from vllm.logger import init_logger
 from vllm.model_executor.models.qwen3 import Qwen3Attention
 from vllm.model_executor.models.qwen3_moe import Qwen3MoeAttention
 from vllm.model_executor.models.qwen3_vl import (
@@ -11,9 +10,6 @@ from vllm.model_executor.models.qwen3_vl import (
 
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.ops.rotary_embedding import AscendMRotaryEmbedding
-from vllm_ascend.ops.shmem_runtime import log_shmem_path_once
-
-logger = init_logger(__name__)
 
 def tensor_parallel_wrap(func):
     def wrap(*args, **kwargs):
@@ -36,14 +32,6 @@ def tensor_parallel_wrap(func):
 
 
 def forward_with_split_qkv_rmsnorm_mrope(self, positions: torch.Tensor, hidden_states: torch.Tensor):
-    log_shmem_path_once(
-        f"frontend-qwen3-forward:{self.attn.layer_name}",
-        "frontend_qwen3_forward layer=%s action=enter rotary_cls=%s hidden_tokens=%d graph_capture=%s",
-        self.attn.layer_name,
-        type(self.rotary_emb).__name__,
-        hidden_states.shape[0],
-        bool(getattr(_EXTRA_CTX, "capturing", False)),
-    )
     qkv, _ = self.qkv_proj(hidden_states)
     if isinstance(self.rotary_emb, AscendMRotaryEmbedding):
         cos_sin = self.rotary_emb.cos_sin_cache[positions]
