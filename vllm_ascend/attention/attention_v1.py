@@ -71,6 +71,14 @@ from vllm_ascend.worker.kvcomp_utils import KVCompMetaData
 # default max value of sliding window size
 SWA_INT_MAX = 2147483647
 _ATTN_KEYS_BUFFER = None
+_RESHAPE_CACHE_STREAM: torch.npu.Stream | None = None
+
+
+def _get_reshape_cache_stream() -> torch.npu.Stream:
+    global _RESHAPE_CACHE_STREAM
+    if _RESHAPE_CACHE_STREAM is None:
+        _RESHAPE_CACHE_STREAM = torch.npu.Stream()
+    return _RESHAPE_CACHE_STREAM
 
 
 @register_backend(AttentionBackendEnum.CUSTOM, "ASCEND")
@@ -1308,15 +1316,41 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 self.key_cache, self.value_cache = kv_cache[0], kv_cache[1]
             slots = attn_metadata.slot_mapping
             encoder_decoder = self.attn_type == AttentionType.ENCODER_DECODER
-            DeviceOperator.reshape_and_cache(
-                key=key[: attn_metadata.num_actual_tokens] if not encoder_decoder else key,
-                value=value[: attn_metadata.num_actual_tokens] if not encoder_decoder else value,
-                key_cache=self.key_cache,
-                value_cache=self.value_cache,
-                # quick fix to make sure slots is int32 for cross attention case.
-                # see: https://github.com/vllm-project/vllm/blob/ce88756b967c2c5006746a424c15dd59a284ed8c/vllm/model_executor/layers/attention/cross_attention.py#L117
-                slot_mapping=slots[: attn_metadata.num_actual_tokens] if not encoder_decoder else slots.to(torch.int32),
-            )
+            cache_key = key[: attn_metadata.num_actual_tokens] if not encoder_decoder else key
+            cache_value = value[: attn_metadata.num_actual_tokens] if not encoder_decoder else value
+            # quick fix to make sure slots is int32 for cross attention case.
+            # see: https://github.com/vllm-project/vllm/blob/ce88756b967c2c5006746a424c15dd59a284ed8c/vllm/model_executor/layers/attention/cross_attention.py#L117
+            cache_slots = slots[: attn_metadata.num_actual_tokens] if not encoder_decoder else slots.to(torch.int32)
+
+            # Keep reshape/cache on a dedicated stream for both eager and
+            # graph-replay prefill paths. The compute stream only waits on the
+            # recorded event right before FIA submission, so capture/replay can
+            # still benefit from host-side KV-write decoupling.
+            use_async_cache_stream = attn_metadata.attn_state != AscendAttentionState.DecodeOnly
+            if use_async_cache_stream:
+                current_stream = torch.npu.current_stream()
+                reshape_cache_stream = _get_reshape_cache_stream()
+                reshape_cache_stream.wait_stream(current_stream)
+                with torch.npu.stream(reshape_cache_stream):
+                    DeviceOperator.reshape_and_cache(
+                        key=cache_key,
+                        value=cache_value,
+                        key_cache=self.key_cache,
+                        value_cache=self.value_cache,
+                        slot_mapping=cache_slots,
+                    )
+                    reshape_cache_event = torch.npu.Event()
+                    reshape_cache_event.record(reshape_cache_stream)
+                attn_metadata.reshape_cache_event = reshape_cache_event
+            else:
+                DeviceOperator.reshape_and_cache(
+                    key=cache_key,
+                    value=cache_value,
+                    key_cache=self.key_cache,
+                    value_cache=self.value_cache,
+                    slot_mapping=cache_slots,
+                )
+                attn_metadata.reshape_cache_event = None
             notify_kv_cache_written()
         return query, key, value, output
 
@@ -1329,6 +1363,13 @@ class AscendAttentionBackendImpl(AttentionImpl):
         attn_metadata: AscendMetadata,
         output: torch.Tensor,
     ):
+        reshape_cache_event = attn_metadata.reshape_cache_event
+        if (
+            reshape_cache_event is not None
+            and attn_metadata.attn_state != AscendAttentionState.PrefillNoCache
+        ):
+            torch.npu.current_stream().wait_event(reshape_cache_event)
+            attn_metadata.reshape_cache_event = None
         record_attention_compute_start()
         return self.forward_fused_infer_attention(query, key, value, attn_metadata, output, kv_cache)
 
