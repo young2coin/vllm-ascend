@@ -20,6 +20,7 @@ _DEFAULT_LOCAL_MEM_SIZE = 1024 * 1024 * 1024
 _DEFAULT_IP_PORT = "tcp://127.0.0.1:8667"
 _OUTPUT_BUFFER_ALIGNMENT = 512
 _MAX_SUPPORTED_RANKS = 8
+_DEFAULT_MIN_MATMUL_ALLREDUCE_TOKENS = 128
 _CACHED_BLOCK_DIMS: Optional[int] = None
 _KERNEL_NAME_BY_DTYPE = {
     torch.bfloat16: "shmem_matmul_allreduce_overlap_bf16",
@@ -96,6 +97,18 @@ def _get_prealloc_output_tokens() -> int:
     return int(get_current_vllm_config().scheduler_config.max_num_batched_tokens)
 
 
+def _get_min_matmul_allreduce_tokens() -> int:
+    value = os.getenv("VLLM_ASCEND_SHMEM_MATMUL_ALLREDUCE_MIN_TOKENS")
+    if value is None or value == "":
+        return _DEFAULT_MIN_MATMUL_ALLREDUCE_TOKENS
+    min_tokens = int(value)
+    if min_tokens < 1:
+        raise RuntimeError(
+            "VLLM_ASCEND_SHMEM_MATMUL_ALLREDUCE_MIN_TOKENS must be positive"
+        )
+    return min_tokens
+
+
 def _is_graph_capturing() -> bool:
     if not is_forward_context_available():
         return False
@@ -136,6 +149,7 @@ def prepare_shmem_matmul_allreduce(layer: torch.nn.Module) -> None:
     setattr(layer, "_shmem_kernel_name", kernel_name)
     setattr(layer, "_shmem_block_dims", _get_block_dims())
     setattr(layer, "_shmem_kernel_entry", None)
+    setattr(layer, "_shmem_can_implement_entry", None)
     setattr(layer, "_shmem_matmul_allreduce_weight_t", None)
 
 
@@ -442,11 +456,38 @@ def finalize_shmem_matmul_allreduce(layer: torch.nn.Module) -> None:
             "shmem_operators does not expose required kernel: "
             f"{layer._shmem_kernel_name}"
         )
+    layer._shmem_can_implement_entry = _RUNTIME.get_kernel_entry(
+        layer._shmem_block_dims, "shmem_matmul_allreduce_can_implement_bf16"
+    )
     _RUNTIME.prepare_symmetric_output(
         (_get_prealloc_output_tokens(), int(weight_t.shape[1])),
         weight_t.dtype,
         weight_t.device,
     )
+
+
+def can_use_shmem_matmul_allreduce(
+    layer: torch.nn.Module,
+    input_parallel: torch.Tensor,
+) -> bool:
+    if getattr(layer, "_shmem_static_reason", None) is not None:
+        return False
+    weight_t = getattr(layer, "_shmem_matmul_allreduce_weight_t", None)
+    can_implement = getattr(layer, "_shmem_can_implement_entry", None)
+    if weight_t is None or can_implement is None:
+        return False
+    if input_parallel.dtype != weight_t.dtype:
+        return False
+    if input_parallel.device != weight_t.device:
+        return False
+    if input_parallel.shape[-1] != weight_t.shape[0]:
+        return False
+    m = int(input_parallel.numel() // input_parallel.shape[-1])
+    if m < _get_min_matmul_allreduce_tokens():
+        return False
+    n = int(weight_t.shape[1])
+    k = int(input_parallel.shape[-1])
+    return bool(can_implement(m, n, k))
 
 
 def maybe_shmem_matmul_allreduce(

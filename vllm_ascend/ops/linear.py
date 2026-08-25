@@ -42,6 +42,7 @@ from vllm.utils.torch_utils import direct_register_custom_op
 
 from vllm_ascend.ops.linear_op import get_parallel_op, get_replicated_op
 from vllm_ascend.ops.shmem_runtime import (
+    can_use_shmem_matmul_allreduce,
     finalize_shmem_matmul_allreduce,
     prepare_shmem_matmul_allreduce,
     shmem_matmul_allreduce_enabled,
@@ -402,10 +403,11 @@ class AscendRowParallelLinear(RowParallelLinear):
                 split_input = split_tensor_along_last_dim(input_, self.tp_size)
                 input_parallel = split_input[self.tp_rank].contiguous()
 
-            output = torch.ops.vllm.shmem_matmul_allreduce(input_parallel, self.unique_prefix)
-            if not self.return_bias:
-                return output
-            return output, None
+            if can_use_shmem_matmul_allreduce(self, input_parallel):
+                output = torch.ops.vllm.shmem_matmul_allreduce(input_parallel, self.unique_prefix)
+                if not self.return_bias:
+                    return output
+                return output, None
 
         if self.custom_op is not None:
             return self.custom_op.apply(input_)
