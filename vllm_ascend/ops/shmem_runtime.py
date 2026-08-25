@@ -148,6 +148,8 @@ def prepare_shmem_matmul_allreduce(layer: torch.nn.Module) -> None:
     setattr(layer, "_shmem_static_reason", reason)
     setattr(layer, "_shmem_kernel_name", kernel_name)
     setattr(layer, "_shmem_block_dims", _get_block_dims())
+    min_tokens = _get_min_matmul_allreduce_tokens()
+    setattr(layer, "_shmem_min_matmul_allreduce_tokens", min_tokens)
     setattr(layer, "_shmem_kernel_entry", None)
     setattr(layer, "_shmem_can_implement_entry", None)
     setattr(layer, "_shmem_matmul_allreduce_weight_t", None)
@@ -482,7 +484,12 @@ def can_use_shmem_matmul_allreduce(
     if input_parallel.shape[-1] != weight_t.shape[0]:
         return False
     m = int(input_parallel.numel() // input_parallel.shape[-1])
-    if m < _get_min_matmul_allreduce_tokens():
+    min_tokens = getattr(
+        layer,
+        "_shmem_min_matmul_allreduce_tokens",
+        _DEFAULT_MIN_MATMUL_ALLREDUCE_TOKENS,
+    )
+    if m < min_tokens:
         return False
     n = int(weight_t.shape[1])
     k = int(input_parallel.shape[-1])
