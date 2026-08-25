@@ -473,8 +473,7 @@ def can_use_shmem_matmul_allreduce(
     if getattr(layer, "_shmem_static_reason", None) is not None:
         return False
     weight_t = getattr(layer, "_shmem_matmul_allreduce_weight_t", None)
-    can_implement = getattr(layer, "_shmem_can_implement_entry", None)
-    if weight_t is None or can_implement is None:
+    if weight_t is None:
         return False
     if input_parallel.dtype != weight_t.dtype:
         return False
@@ -487,6 +486,11 @@ def can_use_shmem_matmul_allreduce(
         return False
     n = int(weight_t.shape[1])
     k = int(input_parallel.shape[-1])
+    if torch.compiler.is_compiling():
+        return True
+    can_implement = getattr(layer, "_shmem_can_implement_entry", None)
+    if can_implement is None:
+        return False
     return bool(can_implement(m, n, k))
 
 
@@ -524,6 +528,20 @@ def maybe_shmem_matmul_allreduce(
         raise RuntimeError(
             "shmem matmul-allreduce input/weight shape mismatch: "
             f"input_k={input_parallel.shape[-1]} weight_k={weight_t.shape[0]}"
+        )
+
+    can_implement = getattr(layer, "_shmem_can_implement_entry", None)
+    if can_implement is None:
+        raise RuntimeError(
+            "shmem matmul-allreduce capability entry is not initialized"
+        )
+    m = int(input_parallel.numel() // input_parallel.shape[-1])
+    n = int(weight_t.shape[1])
+    k = int(input_parallel.shape[-1])
+    if not bool(can_implement(m, n, k)):
+        raise RuntimeError(
+            "shmem matmul-allreduce cannot implement shape: "
+            f"m={m} n={n} k={k}"
         )
 
     kernel_entry = getattr(layer, "_shmem_kernel_entry", None)
