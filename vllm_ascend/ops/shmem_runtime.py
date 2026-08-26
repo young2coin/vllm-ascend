@@ -477,12 +477,6 @@ def finalize_shmem_matmul_allreduce(layer: torch.nn.Module) -> None:
     layer._shmem_can_implement_entry = _RUNTIME.get_kernel_entry(
         layer._shmem_block_dims, "shmem_matmul_allreduce_can_implement_bf16"
     )
-    _RUNTIME.prepare_symmetric_output(
-        layer,
-        (_get_prealloc_output_tokens(), int(weight_t.shape[1])),
-        weight_t.dtype,
-        weight_t.device,
-    )
 
 
 def can_use_shmem_matmul_allreduce(
@@ -500,6 +494,7 @@ def can_use_shmem_matmul_allreduce(
         return False
     if input_parallel.shape[-1] != weight_t.shape[0]:
         return False
+    m = int(input_parallel.numel() // input_parallel.shape[-1])
     n = int(weight_t.shape[1])
     k = int(input_parallel.shape[-1])
     if torch.compiler.is_compiling():
