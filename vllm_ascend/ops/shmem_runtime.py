@@ -6,7 +6,6 @@ from typing import Any, Optional
 
 import torch
 import torch.distributed as dist
-from vllm.distributed import tensor_model_parallel_all_reduce
 from vllm.config import get_current_vllm_config
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
@@ -21,11 +20,14 @@ _DEFAULT_LOCAL_MEM_SIZE = 1024 * 1024 * 1024
 _DEFAULT_IP_PORT = "tcp://127.0.0.1:8667"
 _OUTPUT_BUFFER_ALIGNMENT = 512
 _MAX_SUPPORTED_RANKS = 8
-_DEFAULT_MIN_MATMUL_ALLREDUCE_TOKENS = 128
 _CACHED_BLOCK_DIMS: Optional[int] = None
 _KERNEL_NAME_BY_DTYPE = {
     torch.bfloat16: "shmem_matmul_allreduce_overlap_bf16",
 }
+
+
+def _layer_output_key(layer: torch.nn.Module) -> str:
+    return str(getattr(layer, "unique_prefix", getattr(layer, "prefix", id(layer))))
 
 
 def _shmem_trace_enabled() -> bool:
@@ -110,7 +112,7 @@ def _get_prealloc_output_tokens() -> int:
 def _get_min_matmul_allreduce_tokens() -> int:
     value = os.getenv("VLLM_ASCEND_SHMEM_MATMUL_ALLREDUCE_MIN_TOKENS")
     if value is None or value == "":
-        return _DEFAULT_MIN_MATMUL_ALLREDUCE_TOKENS
+        return 1
     min_tokens = int(value)
     if min_tokens < 1:
         raise RuntimeError(
@@ -237,7 +239,9 @@ class _ShmemRuntime:
         self._shmem_operators = None
         self._operators: dict[int, object] = {}
         self._kernel_entries: dict[tuple[int, str], Any] = {}
-        self._output_buffers: dict[tuple[torch.dtype, str], _SymmetricOutputBuffer] = {}
+        self._output_buffers: dict[
+            tuple[str, torch.dtype, str], _SymmetricOutputBuffer
+        ] = {}
         self._printed_operator_call = False
         self._rank: Optional[int] = None
         self._world_size: Optional[int] = None
@@ -358,27 +362,29 @@ class _ShmemRuntime:
         dtype: torch.dtype,
         device: torch.device,
     ) -> torch.Tensor:
-        del layer
-        return self._get_symmetric_output(shape, dtype, device)
+        return self._get_symmetric_output(_layer_output_key(layer), shape, dtype, device)
 
     def prepare_symmetric_output(
         self,
+        layer: torch.nn.Module,
         shape: tuple[int, int],
         dtype: torch.dtype,
         device: torch.device,
     ) -> None:
-        self._prepare_symmetric_output(shape, dtype, device)
+        self._prepare_symmetric_output(_layer_output_key(layer), shape, dtype, device)
 
     def _prepare_symmetric_output(
         self,
+        layer_key: str,
         shape: tuple[int, int],
         dtype: torch.dtype,
         device: torch.device,
     ) -> None:
-        self._get_symmetric_output(shape, dtype, device)
+        self._get_symmetric_output(layer_key, shape, dtype, device)
 
     def _get_symmetric_output(
         self,
+        layer_key: str,
         shape: tuple[int, int],
         dtype: torch.dtype,
         device: torch.device,
@@ -390,7 +396,7 @@ class _ShmemRuntime:
             if device_id is None:
                 device_id = torch.npu.current_device()
             normalized_device = torch.device(f"npu:{device_id}")
-            key = (dtype, str(normalized_device))
+            key = (layer_key, dtype, str(normalized_device))
             requested_bytes = _tensor_nbytes(shape, dtype)
             buffer = self._output_buffers.get(key)
             if buffer is None:
@@ -440,16 +446,6 @@ _RUNTIME = _ShmemRuntime()
 atexit.register(_RUNTIME.destroy)
 
 
-def _fallback_matmul_allreduce(
-    layer: torch.nn.Module,
-    input_parallel: torch.Tensor,
-) -> torch.Tensor:
-    output_parallel = layer.quant_method.apply(layer, input_parallel, bias=None)
-    if layer.reduce_results:
-        return tensor_model_parallel_all_reduce(output_parallel)
-    return output_parallel
-
-
 def finalize_shmem_matmul_allreduce(layer: torch.nn.Module) -> None:
     if not getattr(layer, "_can_try_shmem_matmul_allreduce", False):
         return
@@ -482,6 +478,7 @@ def finalize_shmem_matmul_allreduce(layer: torch.nn.Module) -> None:
         layer._shmem_block_dims, "shmem_matmul_allreduce_can_implement_bf16"
     )
     _RUNTIME.prepare_symmetric_output(
+        layer,
         (_get_prealloc_output_tokens(), int(weight_t.shape[1])),
         weight_t.dtype,
         weight_t.device,
@@ -502,14 +499,6 @@ def can_use_shmem_matmul_allreduce(
     if input_parallel.device != weight_t.device:
         return False
     if input_parallel.shape[-1] != weight_t.shape[0]:
-        return False
-    m = int(input_parallel.numel() // input_parallel.shape[-1])
-    min_tokens = getattr(
-        layer,
-        "_shmem_min_matmul_allreduce_tokens",
-        _DEFAULT_MIN_MATMUL_ALLREDUCE_TOKENS,
-    )
-    if m < min_tokens:
         return False
     n = int(weight_t.shape[1])
     k = int(input_parallel.shape[-1])
@@ -565,14 +554,6 @@ def maybe_shmem_matmul_allreduce(
     m = int(input_parallel.numel() // input_parallel.shape[-1])
     n = int(weight_t.shape[1])
     k = int(input_parallel.shape[-1])
-    min_tokens = getattr(
-        layer,
-        "_shmem_min_matmul_allreduce_tokens",
-        _DEFAULT_MIN_MATMUL_ALLREDUCE_TOKENS,
-    )
-    if m < min_tokens:
-        return _fallback_matmul_allreduce(layer, input_parallel)
-
     if not bool(can_implement(m, n, k)):
         raise RuntimeError(
             "shmem matmul-allreduce cannot implement shape: "
