@@ -6,6 +6,7 @@ from typing import Any, Optional
 
 import torch
 import torch.distributed as dist
+from vllm.distributed import tensor_model_parallel_all_reduce
 from vllm.config import get_current_vllm_config
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
@@ -25,6 +26,15 @@ _CACHED_BLOCK_DIMS: Optional[int] = None
 _KERNEL_NAME_BY_DTYPE = {
     torch.bfloat16: "shmem_matmul_allreduce_overlap_bf16",
 }
+
+
+def _shmem_trace_enabled() -> bool:
+    return os.getenv("VLLM_ASCEND_SHMEM_TRACE", "").lower() in {
+        "1",
+        "on",
+        "true",
+        "yes",
+    }
 
 
 def shmem_matmul_allreduce_enabled() -> bool:
@@ -430,6 +440,16 @@ _RUNTIME = _ShmemRuntime()
 atexit.register(_RUNTIME.destroy)
 
 
+def _fallback_matmul_allreduce(
+    layer: torch.nn.Module,
+    input_parallel: torch.Tensor,
+) -> torch.Tensor:
+    output_parallel = layer.quant_method.apply(layer, input_parallel, bias=None)
+    if layer.reduce_results:
+        return tensor_model_parallel_all_reduce(output_parallel)
+    return output_parallel
+
+
 def finalize_shmem_matmul_allreduce(layer: torch.nn.Module) -> None:
     if not getattr(layer, "_can_try_shmem_matmul_allreduce", False):
         return
@@ -545,6 +565,14 @@ def maybe_shmem_matmul_allreduce(
     m = int(input_parallel.numel() // input_parallel.shape[-1])
     n = int(weight_t.shape[1])
     k = int(input_parallel.shape[-1])
+    min_tokens = getattr(
+        layer,
+        "_shmem_min_matmul_allreduce_tokens",
+        _DEFAULT_MIN_MATMUL_ALLREDUCE_TOKENS,
+    )
+    if m < min_tokens:
+        return _fallback_matmul_allreduce(layer, input_parallel)
+
     if not bool(can_implement(m, n, k)):
         raise RuntimeError(
             "shmem matmul-allreduce cannot implement shape: "

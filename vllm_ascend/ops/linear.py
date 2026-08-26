@@ -25,6 +25,7 @@ import torch.nn as nn
 from torch.nn.parameter import Parameter
 from vllm.config import get_current_vllm_config
 from vllm.distributed import divide, split_tensor_along_last_dim
+from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import (  # noqa
     WEIGHT_LOADER_V2_SUPPORTED,
     ColumnParallelLinear,
@@ -42,6 +43,7 @@ from vllm.utils.torch_utils import direct_register_custom_op
 
 from vllm_ascend.ops.linear_op import get_parallel_op, get_replicated_op
 from vllm_ascend.ops.shmem_runtime import (
+    _shmem_trace_enabled,
     can_use_shmem_matmul_allreduce,
     finalize_shmem_matmul_allreduce,
     prepare_shmem_matmul_allreduce,
@@ -54,6 +56,9 @@ from vllm_ascend.utils import (
     is_310p,
     maybe_trans_nz,
 )
+
+
+logger = init_logger(__name__)
 
 
 def unquantized_gemm(
@@ -375,6 +380,7 @@ class AscendRowParallelLinear(RowParallelLinear):
                 f"layer={prefix}"
             )
 
+        ascend_device_type = get_ascend_device_type()
         self._can_try_shmem_matmul_allreduce = (
             shmem_target
             and reduce_results
@@ -383,8 +389,24 @@ class AscendRowParallelLinear(RowParallelLinear):
             and self.weight.dtype == torch.bfloat16
             and self.bias is None
             and self.out_dtype in (None, torch.bfloat16)
-            and get_ascend_device_type() == AscendDeviceType.A2
+            and ascend_device_type == AscendDeviceType.A2
         )
+        if shmem_target and _shmem_trace_enabled():
+            logger.warning(
+                "[shmem-operator] candidate layer=%s can_try=%s "
+                "reduce_results=%s tp_size=%s quant_method=%s weight_dtype=%s "
+                "bias=%s out_dtype=%s device_type=%s custom_op=%s",
+                prefix,
+                self._can_try_shmem_matmul_allreduce,
+                reduce_results,
+                self.tp_size,
+                type(self.quant_method).__name__,
+                self.weight.dtype,
+                self.bias is not None,
+                self.out_dtype,
+                ascend_device_type,
+                type(self.custom_op).__name__ if self.custom_op is not None else None,
+            )
         if self._can_try_shmem_matmul_allreduce:
             prepare_shmem_matmul_allreduce(self)
 
