@@ -491,6 +491,9 @@ def can_use_shmem_matmul_allreduce(
     m = int(input_parallel.numel() // input_parallel.shape[-1])
     n = int(weight_t.shape[1])
     k = int(input_parallel.shape[-1])
+    min_tokens = int(getattr(layer, "_shmem_min_matmul_allreduce_tokens", 1))
+    if m < min_tokens:
+        return False
     if torch.compiler.is_compiling():
         return True
     can_implement = getattr(layer, "_shmem_can_implement_entry", None)
