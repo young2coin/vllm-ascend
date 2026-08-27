@@ -26,10 +26,6 @@ _KERNEL_NAME_BY_DTYPE = {
 }
 
 
-def _layer_output_key(layer: torch.nn.Module) -> str:
-    return str(getattr(layer, "unique_prefix", getattr(layer, "prefix", id(layer))))
-
-
 def _shmem_trace_enabled() -> bool:
     return os.getenv("VLLM_ASCEND_SHMEM_TRACE", "").lower() in {
         "1",
@@ -239,9 +235,7 @@ class _ShmemRuntime:
         self._shmem_operators = None
         self._operators: dict[int, object] = {}
         self._kernel_entries: dict[tuple[int, str], Any] = {}
-        self._output_buffers: dict[
-            tuple[str, torch.dtype, str], _SymmetricOutputBuffer
-        ] = {}
+        self._output_buffers: dict[tuple[torch.dtype, str], _SymmetricOutputBuffer] = {}
         self._printed_operator_call = False
         self._rank: Optional[int] = None
         self._world_size: Optional[int] = None
@@ -362,7 +356,8 @@ class _ShmemRuntime:
         dtype: torch.dtype,
         device: torch.device,
     ) -> torch.Tensor:
-        return self._get_symmetric_output(_layer_output_key(layer), shape, dtype, device)
+        del layer
+        return self._get_symmetric_output(shape, dtype, device)
 
     def prepare_symmetric_output(
         self,
@@ -371,20 +366,19 @@ class _ShmemRuntime:
         dtype: torch.dtype,
         device: torch.device,
     ) -> None:
-        self._prepare_symmetric_output(_layer_output_key(layer), shape, dtype, device)
+        del layer
+        self._prepare_symmetric_output(shape, dtype, device)
 
     def _prepare_symmetric_output(
         self,
-        layer_key: str,
         shape: tuple[int, int],
         dtype: torch.dtype,
         device: torch.device,
     ) -> None:
-        self._get_symmetric_output(layer_key, shape, dtype, device)
+        self._get_symmetric_output(shape, dtype, device)
 
     def _get_symmetric_output(
         self,
-        layer_key: str,
         shape: tuple[int, int],
         dtype: torch.dtype,
         device: torch.device,
@@ -396,7 +390,7 @@ class _ShmemRuntime:
             if device_id is None:
                 device_id = torch.npu.current_device()
             normalized_device = torch.device(f"npu:{device_id}")
-            key = (layer_key, dtype, str(normalized_device))
+            key = (dtype, str(normalized_device))
             requested_bytes = _tensor_nbytes(shape, dtype)
             buffer = self._output_buffers.get(key)
             if buffer is None:
