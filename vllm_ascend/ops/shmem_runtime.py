@@ -581,4 +581,5 @@ def maybe_shmem_matmul_allreduce(
         int(input_2d.shape[1]),
         input_2d.dtype,
     )
-    return output_2d.reshape(*input_parallel.shape[:-1], weight_t.shape[1])
+    output = output_2d.clone()
+    return output.reshape(*input_parallel.shape[:-1], weight_t.shape[1])
