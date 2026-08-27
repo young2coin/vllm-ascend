@@ -20,6 +20,9 @@ _DEFAULT_LOCAL_MEM_SIZE = 1024 * 1024 * 1024
 _DEFAULT_IP_PORT = "tcp://127.0.0.1:8667"
 _OUTPUT_BUFFER_ALIGNMENT = 512
 _MAX_SUPPORTED_RANKS = 8
+_MAX_SUPPORTED_M = 32768
+_MAX_SUPPORTED_N = 5120
+_REQUIRED_BLOCK_DIMS = 20
 _CACHED_BLOCK_DIMS: Optional[int] = None
 _KERNEL_NAME_BY_DTYPE = {
     torch.bfloat16: "shmem_matmul_allreduce_overlap_bf16",
@@ -108,7 +111,7 @@ def _get_prealloc_output_tokens() -> int:
 def _get_min_matmul_allreduce_tokens() -> int:
     value = os.getenv("VLLM_ASCEND_SHMEM_MATMUL_ALLREDUCE_MIN_TOKENS")
     if value is None or value == "":
-        return 1
+        return 128
     min_tokens = int(value)
     if min_tokens < 1:
         raise RuntimeError(
@@ -121,6 +124,24 @@ def _is_graph_capturing() -> bool:
     if not is_forward_context_available():
         return False
     return bool(getattr(get_forward_context(), "capturing", False))
+
+
+def _can_implement_static(
+    m: int,
+    n: int,
+    k: int,
+    rank_size: int,
+    block_dims: int,
+) -> bool:
+    return (
+        m > 0
+        and n > 0
+        and k > 0
+        and 1 <= rank_size <= _MAX_SUPPORTED_RANKS
+        and block_dims == _REQUIRED_BLOCK_DIMS
+        and m <= _MAX_SUPPORTED_M
+        and n <= _MAX_SUPPORTED_N
+    )
 
 
 def _build_weight_for_shmem(layer: torch.nn.Module) -> torch.Tensor:
@@ -471,6 +492,12 @@ def finalize_shmem_matmul_allreduce(layer: torch.nn.Module) -> None:
     layer._shmem_can_implement_entry = _RUNTIME.get_kernel_entry(
         layer._shmem_block_dims, "shmem_matmul_allreduce_can_implement_bf16"
     )
+    _RUNTIME.prepare_symmetric_output(
+        layer,
+        (_get_prealloc_output_tokens(), int(weight_t.shape[1])),
+        weight_t.dtype,
+        weight_t.device,
+    )
 
 
 def can_use_shmem_matmul_allreduce(
@@ -493,6 +520,10 @@ def can_use_shmem_matmul_allreduce(
     k = int(input_parallel.shape[-1])
     min_tokens = int(getattr(layer, "_shmem_min_matmul_allreduce_tokens", 1))
     if m < min_tokens:
+        return False
+    rank_size = int(getattr(layer, "tp_size", 0))
+    block_dims = int(getattr(layer, "_shmem_block_dims", 0))
+    if not _can_implement_static(m, n, k, rank_size, block_dims):
         return False
     if torch.compiler.is_compiling():
         return True
@@ -546,6 +577,13 @@ def maybe_shmem_matmul_allreduce(
     m = int(input_parallel.numel() // input_parallel.shape[-1])
     n = int(weight_t.shape[1])
     k = int(input_parallel.shape[-1])
+    rank_size = int(getattr(layer, "tp_size", 0))
+    block_dims = int(getattr(layer, "_shmem_block_dims", 0))
+    if not _can_implement_static(m, n, k, rank_size, block_dims):
+        raise RuntimeError(
+            "shmem matmul-allreduce cannot implement shape: "
+            f"m={m} n={n} k={k}"
+        )
     if not bool(can_implement(m, n, k)):
         raise RuntimeError(
             "shmem matmul-allreduce cannot implement shape: "
