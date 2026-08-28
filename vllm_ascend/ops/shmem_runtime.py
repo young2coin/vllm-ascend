@@ -6,7 +6,6 @@ from typing import Any, Optional
 
 import torch
 import torch.distributed as dist
-from vllm.config import get_current_vllm_config
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
 
@@ -19,6 +18,7 @@ _DEFAULT_BLOCK_DIMS = 20
 _DEFAULT_LOCAL_MEM_SIZE = 1024 * 1024 * 1024
 _DEFAULT_IP_PORT = "tcp://127.0.0.1:8667"
 _OUTPUT_BUFFER_ALIGNMENT = 512
+_DEFAULT_OUTPUT_BUFFER_SLOTS = 8
 _MAX_SUPPORTED_RANKS = 8
 _MAX_SUPPORTED_M = 32768
 _MAX_SUPPORTED_N = 5120
@@ -95,17 +95,16 @@ def _get_configured_output_buffer_bytes() -> int:
     return _align_up(buffer_bytes, _OUTPUT_BUFFER_ALIGNMENT)
 
 
-def _get_prealloc_output_tokens() -> int:
-    value = os.getenv("VLLM_ASCEND_SHMEM_OUTPUT_MAX_TOKENS")
-    if value is not None and value != "":
-        max_tokens = int(value)
-        if max_tokens <= 0:
-            raise RuntimeError(
-                "VLLM_ASCEND_SHMEM_OUTPUT_MAX_TOKENS must be positive"
-            )
-        return max_tokens
-
-    return int(get_current_vllm_config().scheduler_config.max_num_batched_tokens)
+def _get_output_buffer_slots() -> int:
+    value = os.getenv("VLLM_ASCEND_SHMEM_OUTPUT_BUFFER_SLOTS")
+    if value is None or value == "":
+        return _DEFAULT_OUTPUT_BUFFER_SLOTS
+    slots = int(value)
+    if slots <= 0:
+        raise RuntimeError(
+            "VLLM_ASCEND_SHMEM_OUTPUT_BUFFER_SLOTS must be positive"
+        )
+    return slots
 
 
 def _get_min_matmul_allreduce_tokens() -> int:
@@ -141,12 +140,6 @@ def _can_implement_static(
         and block_dims == _REQUIRED_BLOCK_DIMS
         and m <= _MAX_SUPPORTED_M
         and n <= _MAX_SUPPORTED_N
-    )
-
-
-def _layer_output_key(layer: torch.nn.Module) -> str:
-    return str(
-        getattr(layer, "unique_prefix", None) or getattr(layer, "prefix", "")
     )
 
 
@@ -226,7 +219,11 @@ class _SymmetricOutputBuffer:
                 self.device,
             )
 
-    def make_tensor(self, shape: tuple[int, ...], requested_bytes: int) -> torch.Tensor:
+    def make_tensor(
+        self,
+        shape: tuple[int, ...],
+        requested_bytes: int,
+    ) -> torch.Tensor:
         if requested_bytes > self.buffer_bytes:
             raise RuntimeError(
                 "shmem output shape exceeds fixed buffer capacity: "
@@ -236,21 +233,85 @@ class _SymmetricOutputBuffer:
                 "captured output size."
             )
         if shape not in self._tensors:
-            if _is_graph_capturing():
-                raise RuntimeError(
-                    "shmem output tensor wrapper was not prepared before "
-                    "graph capture: "
-                    f"shape={shape}. Run a non-graph warmup for this "
-                    "capture shape before ACL graph capture."
-                )
             self._ensure_tensor_for_shape(shape)
         return self._tensors[shape]
+
+    def can_hold(self, requested_bytes: int) -> bool:
+        return requested_bytes <= self.buffer_bytes
 
     def free(self) -> None:
         self._tensors.clear()
         if self._ptr:
             self._ash.aclshmem_free(self._ptr)
             self._ptr = 0
+
+
+class _SymmetricOutputPool:
+    def __init__(
+        self,
+        ash: Any,
+        tensor_from_ptr: Any,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> None:
+        self.dtype = dtype
+        self.device = device
+        self._ash = ash
+        self._tensor_from_ptr = tensor_from_ptr
+        self._slots: list[Optional[_SymmetricOutputBuffer]] = [
+            None
+        ] * _get_output_buffer_slots()
+        self._retired_slots: list[_SymmetricOutputBuffer] = []
+        self._next_slot = 0
+
+    @property
+    def slot_count(self) -> int:
+        return len(self._slots)
+
+    def next_slot(self) -> int:
+        slot = self._next_slot
+        self._next_slot = (self._next_slot + 1) % self.slot_count
+        return slot
+
+    def prepare(self, shape: tuple[int, ...], requested_bytes: int) -> None:
+        for slot in range(self.slot_count):
+            self.make_tensor(shape, requested_bytes, slot)
+
+    def make_tensor(
+        self,
+        shape: tuple[int, ...],
+        requested_bytes: int,
+        slot: int,
+    ) -> torch.Tensor:
+        buffer = self._slots[slot]
+        if buffer is None or not buffer.can_hold(requested_bytes):
+            if _is_graph_capturing():
+                raise RuntimeError(
+                    "shmem output buffer slot was not prepared before "
+                    "graph capture: "
+                    f"shape={shape} slot={slot}. Run a non-graph warmup "
+                    "or prepare capture buffers before ACL graph capture."
+                )
+            if buffer is not None:
+                self._retired_slots.append(buffer)
+            buffer = _SymmetricOutputBuffer(
+                self._ash,
+                self._tensor_from_ptr,
+                self.dtype,
+                self.device,
+                requested_bytes,
+            )
+            self._slots[slot] = buffer
+        return buffer.make_tensor(shape, requested_bytes)
+
+    def free(self) -> None:
+        for buffer in self._slots:
+            if buffer is not None:
+                buffer.free()
+        self._slots.clear()
+        for buffer in self._retired_slots:
+            buffer.free()
+        self._retired_slots.clear()
 
 
 class _ShmemRuntime:
@@ -262,8 +323,8 @@ class _ShmemRuntime:
         self._shmem_operators = None
         self._operators: dict[int, object] = {}
         self._kernel_entries: dict[tuple[int, str], Any] = {}
-        self._output_buffers: dict[
-            tuple[str, torch.dtype, str], _SymmetricOutputBuffer
+        self._output_pools: dict[
+            tuple[torch.dtype, str], _SymmetricOutputPool
         ] = {}
         self._printed_operator_call = False
         self._rank: Optional[int] = None
@@ -385,9 +446,8 @@ class _ShmemRuntime:
         dtype: torch.dtype,
         device: torch.device,
     ) -> torch.Tensor:
-        return self._get_symmetric_output(
-            _layer_output_key(layer), shape, dtype, device
-        )
+        del layer
+        return self._get_symmetric_output(shape, dtype, device)
 
     def prepare_symmetric_output(
         self,
@@ -396,65 +456,84 @@ class _ShmemRuntime:
         dtype: torch.dtype,
         device: torch.device,
     ) -> None:
-        self._prepare_symmetric_output(
-            _layer_output_key(layer), shape, dtype, device
-        )
+        del layer
+        self._prepare_symmetric_output(shape, dtype, device)
 
     def _prepare_symmetric_output(
         self,
-        layer_key: str,
         shape: tuple[int, int],
         dtype: torch.dtype,
         device: torch.device,
     ) -> None:
-        self._get_symmetric_output(layer_key, shape, dtype, device)
+        with self._lock:
+            pool = self._get_output_pool(dtype, device)
+            requested_bytes = _tensor_nbytes(shape, dtype)
+            pool.prepare(shape, requested_bytes)
+
+    def _get_output_pool(
+        self,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> _SymmetricOutputPool:
+        assert self._ash is not None
+        assert self._tensor_from_ptr is not None
+        device_id = device.index
+        if device_id is None:
+            device_id = torch.npu.current_device()
+        normalized_device = torch.device(f"npu:{device_id}")
+        key = (dtype, str(normalized_device))
+        pool = self._output_pools.get(key)
+        if pool is None:
+            if _is_graph_capturing():
+                raise RuntimeError(
+                    "shmem output buffer pool was not allocated before graph "
+                    "capture. Run a non-graph warmup before ACL graph capture."
+                )
+            pool = _SymmetricOutputPool(
+                self._ash,
+                self._tensor_from_ptr,
+                dtype,
+                normalized_device,
+            )
+            self._output_pools[key] = pool
+        return pool
+
+    def _next_output_slot(self, pool: _SymmetricOutputPool) -> int:
+        if is_forward_context_available():
+            forward_context = get_forward_context()
+            slot_state = getattr(forward_context, "_shmem_output_slot_state", None)
+            if slot_state is None:
+                slot_state = {}
+                setattr(forward_context, "_shmem_output_slot_state", slot_state)
+            key = (pool.dtype, str(pool.device))
+            slot = slot_state.get(key, 0)
+            slot_state[key] = slot + 1
+            return slot % pool.slot_count
+        return pool.next_slot()
 
     def _get_symmetric_output(
         self,
-        layer_key: str,
         shape: tuple[int, int],
         dtype: torch.dtype,
         device: torch.device,
     ) -> torch.Tensor:
         with self._lock:
-            assert self._ash is not None
-            assert self._tensor_from_ptr is not None
-            device_id = device.index
-            if device_id is None:
-                device_id = torch.npu.current_device()
-            normalized_device = torch.device(f"npu:{device_id}")
-            key = (layer_key, dtype, str(normalized_device))
+            pool = self._get_output_pool(dtype, device)
             requested_bytes = _tensor_nbytes(shape, dtype)
-            buffer = self._output_buffers.get(key)
-            if buffer is None:
-                if _is_graph_capturing():
-                    raise RuntimeError(
-                        "shmem output buffer was not allocated before graph "
-                        "capture. Run a non-graph warmup before ACL graph "
-                        "capture, or set VLLM_ASCEND_SHMEM_OUTPUT_BUFFER_BYTES "
-                        "and initialize the runtime before capture."
-                    )
-                buffer = _SymmetricOutputBuffer(
-                    self._ash,
-                    self._tensor_from_ptr,
-                    dtype,
-                    normalized_device,
-                    requested_bytes,
-                )
-                self._output_buffers[key] = buffer
-            return buffer.make_tensor(shape, requested_bytes)
+            slot = self._next_output_slot(pool)
+            return pool.make_tensor(shape, requested_bytes, slot)
 
     def destroy(self) -> None:
         with self._lock:
             if not self._initialized or self._ash is None:
                 return
             try:
-                for buffer in self._output_buffers.values():
+                for pool in self._output_pools.values():
                     try:
-                        buffer.free()
+                        pool.free()
                     except Exception:
                         logger.exception("Failed to free shmem output buffer")
-                self._output_buffers.clear()
+                self._output_pools.clear()
                 self._kernel_entries.clear()
                 self._operators.clear()
                 self._ash.aclshmem_global_exit(0)
@@ -503,12 +582,6 @@ def finalize_shmem_matmul_allreduce(layer: torch.nn.Module) -> None:
         )
     layer._shmem_can_implement_entry = _RUNTIME.get_kernel_entry(
         layer._shmem_block_dims, "shmem_matmul_allreduce_can_implement_bf16"
-    )
-    _RUNTIME.prepare_symmetric_output(
-        layer,
-        (_get_prealloc_output_tokens(), int(weight_t.shape[1])),
-        weight_t.dtype,
-        weight_t.device,
     )
 
 
