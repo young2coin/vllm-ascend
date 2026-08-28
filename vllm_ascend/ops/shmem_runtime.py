@@ -144,6 +144,12 @@ def _can_implement_static(
     )
 
 
+def _layer_output_key(layer: torch.nn.Module) -> str:
+    return str(
+        getattr(layer, "unique_prefix", None) or getattr(layer, "prefix", "")
+    )
+
+
 def _build_weight_for_shmem(layer: torch.nn.Module) -> torch.Tensor:
     cached = getattr(layer, "_shmem_matmul_allreduce_weight_t", None)
     weight_t_view = layer.weight.transpose(0, 1)
@@ -256,7 +262,9 @@ class _ShmemRuntime:
         self._shmem_operators = None
         self._operators: dict[int, object] = {}
         self._kernel_entries: dict[tuple[int, str], Any] = {}
-        self._output_buffers: dict[tuple[torch.dtype, str], _SymmetricOutputBuffer] = {}
+        self._output_buffers: dict[
+            tuple[str, torch.dtype, str], _SymmetricOutputBuffer
+        ] = {}
         self._printed_operator_call = False
         self._rank: Optional[int] = None
         self._world_size: Optional[int] = None
@@ -377,8 +385,9 @@ class _ShmemRuntime:
         dtype: torch.dtype,
         device: torch.device,
     ) -> torch.Tensor:
-        del layer
-        return self._get_symmetric_output(shape, dtype, device)
+        return self._get_symmetric_output(
+            _layer_output_key(layer), shape, dtype, device
+        )
 
     def prepare_symmetric_output(
         self,
@@ -387,19 +396,22 @@ class _ShmemRuntime:
         dtype: torch.dtype,
         device: torch.device,
     ) -> None:
-        del layer
-        self._prepare_symmetric_output(shape, dtype, device)
+        self._prepare_symmetric_output(
+            _layer_output_key(layer), shape, dtype, device
+        )
 
     def _prepare_symmetric_output(
         self,
+        layer_key: str,
         shape: tuple[int, int],
         dtype: torch.dtype,
         device: torch.device,
     ) -> None:
-        self._get_symmetric_output(shape, dtype, device)
+        self._get_symmetric_output(layer_key, shape, dtype, device)
 
     def _get_symmetric_output(
         self,
+        layer_key: str,
         shape: tuple[int, int],
         dtype: torch.dtype,
         device: torch.device,
@@ -411,7 +423,7 @@ class _ShmemRuntime:
             if device_id is None:
                 device_id = torch.npu.current_device()
             normalized_device = torch.device(f"npu:{device_id}")
-            key = (dtype, str(normalized_device))
+            key = (layer_key, dtype, str(normalized_device))
             requested_bytes = _tensor_nbytes(shape, dtype)
             buffer = self._output_buffers.get(key)
             if buffer is None:
@@ -622,5 +634,4 @@ def maybe_shmem_matmul_allreduce(
         int(input_2d.shape[1]),
         input_2d.dtype,
     )
-    output = output_2d.clone()
-    return output.reshape(*input_parallel.shape[:-1], weight_t.shape[1])
+    return output_2d.reshape(*input_parallel.shape[:-1], weight_t.shape[1])
