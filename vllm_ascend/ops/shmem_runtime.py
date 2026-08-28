@@ -18,7 +18,7 @@ _DEFAULT_BLOCK_DIMS = 20
 _DEFAULT_LOCAL_MEM_SIZE = 1024 * 1024 * 1024
 _DEFAULT_IP_PORT = "tcp://127.0.0.1:8667"
 _OUTPUT_BUFFER_ALIGNMENT = 512
-_DEFAULT_OUTPUT_BUFFER_SLOTS = 8
+_DEFAULT_OUTPUT_BUFFER_SLOTS = 2
 _MAX_SUPPORTED_RANKS = 8
 _MAX_SUPPORTED_M = 32768
 _MAX_SUPPORTED_N = 5120
@@ -201,7 +201,13 @@ class _SymmetricOutputBuffer:
         self.device = device
         self._ash = ash
         self._tensor_from_ptr = tensor_from_ptr
-        self._ptr = int(ash.aclshmem_malloc(self.buffer_bytes) or 0)
+        try:
+            self._ptr = int(ash.aclshmem_malloc(self.buffer_bytes) or 0)
+        except RuntimeError as exc:
+            raise RuntimeError(
+                "aclshmem_malloc failed for shmem output buffer: "
+                f"buffer_bytes={self.buffer_bytes}"
+            ) from exc
         self._tensors: dict[tuple[int, ...], torch.Tensor] = {}
 
         if not self._ptr:
